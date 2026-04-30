@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use he_router::{
-    HeRouter, HeRouterConfig, RouteRequest, TlsBackend, bind_dry_run, route_get,
-    validate_kernel_ready,
+    HeRouter, HeRouterConfig, RouteRequest, TlsBackend, bind_dry_run, kernel_prepare_plan,
+    route_get, validate_kernel_ready,
 };
+use serde_json::json;
 
 #[derive(Debug, Parser)]
 #[command(name = "he-router")]
@@ -14,6 +15,8 @@ use he_router::{
 struct Cli {
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -27,6 +30,18 @@ enum Command {
     },
     /// Validate config, kernel sysctls, and local route.
     Check,
+    /// Print or apply Linux sysctl/route preparation.
+    Prepare {
+        /// Apply the commands directly. Run as root or through sudo.
+        #[arg(long)]
+        apply: bool,
+        /// Print a systemd oneshot unit instead of shell commands.
+        #[arg(long)]
+        systemd: bool,
+        /// Optional service that should start after the generated systemd unit.
+        #[arg(long)]
+        before_service: Option<String>,
+    },
     /// Derive the source IPv6 for an account/token pair.
     Derive {
         #[arg(long)]
@@ -58,12 +73,84 @@ fn main() -> he_router::Result<()> {
                 )));
             }
             HeRouterConfig::write_example(&cli.config)?;
-            println!("wrote {}", cli.config.display());
+            if cli.json {
+                print_json(json!({ "written": cli.config.display().to_string() }))?;
+            } else {
+                println!("wrote {}", cli.config.display());
+            }
         }
         Command::Check => {
             let cfg = HeRouterConfig::load_from(&cli.config)?;
             validate_kernel_ready(&cfg)?;
-            println!("kernel ready for prefix {}", cfg.ipv6_prefix);
+            if cli.json {
+                print_json(json!({
+                    "ok": true,
+                    "enabled": cfg.enabled,
+                    "prefix": cfg.ipv6_prefix,
+                }))?;
+            } else {
+                println!("kernel ready for prefix {}", cfg.ipv6_prefix);
+            }
+        }
+        Command::Prepare {
+            apply,
+            systemd,
+            before_service,
+        } => {
+            if apply && systemd {
+                return Err(he_router::HeRouterError::Config(
+                    "--apply and --systemd are mutually exclusive".to_string(),
+                ));
+            }
+
+            let cfg = HeRouterConfig::load_from(&cli.config)?;
+            let Some(plan) = kernel_prepare_plan(&cfg)? else {
+                if cli.json {
+                    print_json(json!({ "enabled": false, "commands": [] }))?;
+                } else {
+                    println!("he-router is disabled; no kernel preparation needed");
+                }
+                return Ok(());
+            };
+
+            let prefix = plan.prefix().to_string();
+            if systemd {
+                let unit = plan.systemd_unit(before_service.as_deref());
+                if cli.json {
+                    print_json(json!({
+                        "prefix": prefix,
+                        "systemd_unit": unit,
+                    }))?;
+                } else {
+                    print!("{unit}");
+                }
+                return Ok(());
+            }
+
+            if apply {
+                plan.apply()?;
+                if cli.json {
+                    print_json(json!({
+                        "applied": true,
+                        "prefix": prefix,
+                    }))?;
+                } else {
+                    println!("applied kernel preparation for prefix {prefix}");
+                }
+                return Ok(());
+            }
+
+            let commands = plan.shell_commands();
+            if cli.json {
+                print_json(json!({
+                    "prefix": prefix,
+                    "commands": commands,
+                }))?;
+            } else {
+                for command in commands {
+                    println!("{command}");
+                }
+            }
         }
         Command::Derive {
             account_id,
@@ -75,10 +162,27 @@ fn main() -> he_router::Result<()> {
                 ..cfg
             })?;
             match router.derive_source_ip(&account_id, access_token.as_deref())? {
-                Some(ip) => println!("{ip}"),
-                None => println!(
-                    "no route decision: router disabled or token missing for access-token scope"
-                ),
+                Some(ip) => {
+                    if cli.json {
+                        print_json(json!({
+                            "routed": true,
+                            "source_ip": ip.to_string(),
+                        }))?;
+                    } else {
+                        println!("{ip}");
+                    }
+                }
+                None => {
+                    let reason = "router disabled or token missing for access-token scope";
+                    if cli.json {
+                        print_json(json!({
+                            "routed": false,
+                            "reason": reason,
+                        }))?;
+                    } else {
+                        println!("no route decision: {reason}");
+                    }
+                }
             }
         }
         Command::Smoke {
@@ -98,20 +202,49 @@ fn main() -> he_router::Result<()> {
                 proxy_url: None,
             })?
             else {
-                println!(
-                    "no route decision: router disabled or token missing for access-token scope"
-                );
+                let reason = "router disabled or token missing for access-token scope";
+                if cli.json {
+                    print_json(json!({
+                        "routed": false,
+                        "reason": reason,
+                    }))?;
+                } else {
+                    println!("no route decision: {reason}");
+                }
                 return Ok(());
             };
-            println!("binding_key_prefix={}", decision.binding_key_prefix);
-            println!("source_ip={}", decision.source_ip);
-            println!("upstream_origin={}", decision.upstream_origin);
+
             let bound = bind_dry_run(decision.source_ip)?;
-            println!("bind ok {bound}");
-            if let Some(target_ipv6) = target_ipv6 {
-                println!("route_get={}", route_get(target_ipv6, decision.source_ip)?);
+            let route = target_ipv6
+                .map(|target_ipv6| route_get(target_ipv6, decision.source_ip))
+                .transpose()?;
+            if cli.json {
+                print_json(json!({
+                    "routed": true,
+                    "binding_key_prefix": decision.binding_key_prefix,
+                    "source_ip": decision.source_ip.to_string(),
+                    "upstream_origin": decision.upstream_origin,
+                    "bind": bound,
+                    "route_get": route,
+                }))?;
+            } else {
+                println!("binding_key_prefix={}", decision.binding_key_prefix);
+                println!("source_ip={}", decision.source_ip);
+                println!("upstream_origin={}", decision.upstream_origin);
+                println!("bind ok {bound}");
+                if let Some(route) = route {
+                    println!("route_get={route}");
+                }
             }
         }
     }
+    Ok(())
+}
+
+fn print_json(value: serde_json::Value) -> he_router::Result<()> {
+    let raw = serde_json::to_string_pretty(&value).map_err(|err| {
+        he_router::HeRouterError::Config(format!("failed to serialize JSON output: {err}"))
+    })?;
+    println!("{raw}");
     Ok(())
 }

@@ -27,15 +27,47 @@ pub enum HeRouterError {
     TomlSer(#[from] toml::ser::Error),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HeRouterMode {
+    #[default]
+    NativeNonlocalBind,
+}
+
+impl fmt::Display for HeRouterMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NativeNonlocalBind => f.write_str("native-nonlocal-bind"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BindingScope {
+    #[default]
+    AccessToken,
+    Account,
+}
+
+impl fmt::Display for BindingScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AccessToken => f.write_str("access-token"),
+            Self::Account => f.write_str("account"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HeRouterConfig {
     pub enabled: bool,
-    pub mode: String,
+    pub mode: HeRouterMode,
     pub ipv6_prefix: String,
     pub manage_kernel: bool,
     pub require_kernel_ready: bool,
-    pub binding_scope: String,
+    pub binding_scope: BindingScope,
     pub binding_salt: String,
     pub binding_ttl_grace_seconds: u64,
     pub max_client_cache_entries: usize,
@@ -48,11 +80,11 @@ impl Default for HeRouterConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            mode: "native-nonlocal-bind".to_string(),
+            mode: HeRouterMode::NativeNonlocalBind,
             ipv6_prefix: String::new(),
             manage_kernel: false,
             require_kernel_ready: true,
-            binding_scope: "access-token".to_string(),
+            binding_scope: BindingScope::AccessToken,
             binding_salt: String::new(),
             binding_ttl_grace_seconds: 120,
             max_client_cache_entries: 512,
@@ -85,9 +117,6 @@ impl HeRouterConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_mode(self.mode.as_str())?;
-        validate_binding_scope(self.binding_scope.as_str())?;
-
         if !self.ipv6_prefix.trim().is_empty() {
             self.parsed_prefix()?;
         }
@@ -239,6 +268,90 @@ impl fmt::Debug for RouteDecision {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelPreparePlan {
+    prefix: Ipv6Prefix,
+}
+
+impl KernelPreparePlan {
+    pub fn new(prefix: Ipv6Prefix) -> Self {
+        Self { prefix }
+    }
+
+    pub fn prefix(self) -> Ipv6Prefix {
+        self.prefix
+    }
+
+    pub fn shell_commands(self) -> [String; 3] {
+        [
+            "sudo sysctl -w net.ipv6.ip_nonlocal_bind=1".to_string(),
+            "sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0".to_string(),
+            format!(
+                "sudo ip -6 route replace local {} dev lo table local",
+                self.prefix
+            ),
+        ]
+    }
+
+    pub fn systemd_unit(self, before_service: Option<&str>) -> String {
+        let mut unit = String::new();
+        unit.push_str("[Unit]\n");
+        unit.push_str("Description=Prepare he-router IPv6 non-local binding\n");
+        if let Some(before_service) = before_service
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            unit.push_str(&format!("Before={before_service}\n"));
+        }
+        unit.push_str("Wants=network-online.target\n");
+        unit.push_str("After=network-online.target\n\n");
+        unit.push_str("[Service]\n");
+        unit.push_str("Type=oneshot\n");
+        unit.push_str(&format!("Environment=HE_ROUTER_PREFIX={}\n", self.prefix));
+        unit.push_str("ExecStart=/usr/sbin/sysctl -w net.ipv6.ip_nonlocal_bind=1\n");
+        unit.push_str("ExecStart=/usr/sbin/sysctl -w net.ipv6.conf.all.disable_ipv6=0\n");
+        unit.push_str(
+            "ExecStart=/usr/sbin/ip -6 route replace local ${HE_ROUTER_PREFIX} dev lo table local\n",
+        );
+        unit.push_str("RemainAfterExit=yes\n\n");
+        unit.push_str("[Install]\n");
+        unit.push_str("WantedBy=multi-user.target\n");
+        unit
+    }
+
+    pub fn apply(self) -> Result<()> {
+        run_checked("sysctl", ["-w", "net.ipv6.ip_nonlocal_bind=1"].as_slice())?;
+        run_checked(
+            "sysctl",
+            ["-w", "net.ipv6.conf.all.disable_ipv6=0"].as_slice(),
+        )?;
+        let prefix = self.prefix.to_string();
+        run_checked(
+            "ip",
+            [
+                "-6",
+                "route",
+                "replace",
+                "local",
+                prefix.as_str(),
+                "dev",
+                "lo",
+                "table",
+                "local",
+            ]
+            .as_slice(),
+        )
+    }
+}
+
+pub fn kernel_prepare_plan(config: &HeRouterConfig) -> Result<Option<KernelPreparePlan>> {
+    config.validate()?;
+    if !config.enabled {
+        return Ok(None);
+    }
+    Ok(Some(KernelPreparePlan::new(config.parsed_prefix()?)))
+}
+
 #[derive(Debug)]
 pub struct HeRouter {
     config: HeRouterConfig,
@@ -343,7 +456,7 @@ impl HeRouter {
         prefix: Ipv6Prefix,
     ) -> Result<Option<ResolvedBinding>> {
         let Some(binding_material) =
-            binding_material(self.config.binding_scope.as_str(), account_id, access_token)?
+            binding_material(self.config.binding_scope, account_id, access_token)?
         else {
             return Ok(None);
         };
@@ -468,7 +581,6 @@ pub fn validate_kernel_ready(config: &HeRouterConfig) -> Result<()> {
     if !config.enabled {
         return Ok(());
     }
-    validate_mode(config.mode.as_str())?;
     let prefix = config.parsed_prefix()?;
 
     let ip_nonlocal_bind = read_proc_sys_trimmed("/proc/sys/net/ipv6/ip_nonlocal_bind")?;
@@ -517,26 +629,26 @@ pub fn route_get(target_ipv6: Ipv6Addr, source_ip: Ipv6Addr) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn validate_mode(mode: &str) -> Result<()> {
-    if mode == "native-nonlocal-bind" {
+fn run_checked(program: &str, args: &[&str]) -> Result<()> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| HeRouterError::Config(format!("failed to run {program}: {err}")))?;
+    if output.status.success() {
         return Ok(());
     }
-    Err(HeRouterError::Config(format!(
-        "unsupported mode {mode:?}; only native-nonlocal-bind is implemented"
-    )))
-}
 
-fn validate_binding_scope(scope: &str) -> Result<()> {
-    if matches!(scope, "access-token" | "account") {
-        return Ok(());
-    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
     Err(HeRouterError::Config(format!(
-        "unsupported binding_scope {scope:?}; expected access-token or account"
+        "{program} {} failed: {detail}",
+        args.join(" ")
     )))
 }
 
 fn binding_material(
-    binding_scope: &str,
+    binding_scope: BindingScope,
     account_id: &str,
     access_token: Option<&str>,
 ) -> Result<Option<String>> {
@@ -548,7 +660,7 @@ fn binding_material(
     }
 
     match binding_scope {
-        "access-token" => {
+        BindingScope::AccessToken => {
             let Some(token) = access_token
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -557,10 +669,7 @@ fn binding_material(
             };
             Ok(Some(format!("he-router:{account_id}:{token}")))
         }
-        "account" => Ok(Some(format!("he-router:{account_id}:account"))),
-        other => Err(HeRouterError::Config(format!(
-            "unsupported binding_scope {other:?}; expected access-token or account"
-        ))),
+        BindingScope::Account => Ok(Some(format!("he-router:{account_id}:account"))),
     }
 }
 
@@ -856,9 +965,31 @@ mod tests {
     #[test]
     fn account_scope_does_not_need_token() {
         let mut cfg = config();
-        cfg.binding_scope = "account".to_string();
+        cfg.binding_scope = BindingScope::Account;
         let router = HeRouter::new(cfg).unwrap();
         assert!(router.derive_source_ip("42", None).unwrap().is_some());
+    }
+
+    #[test]
+    fn example_config_uses_typed_toml_enums() {
+        let cfg: HeRouterConfig = toml::from_str(include_str!("../config.toml.example")).unwrap();
+        assert_eq!(cfg.mode, HeRouterMode::NativeNonlocalBind);
+        assert_eq!(cfg.binding_scope, BindingScope::AccessToken);
+    }
+
+    #[test]
+    fn prepare_plan_is_explicit_and_replayable() {
+        let plan = kernel_prepare_plan(&config()).unwrap().unwrap();
+        let commands = plan.shell_commands();
+        assert_eq!(commands[0], "sudo sysctl -w net.ipv6.ip_nonlocal_bind=1");
+        assert_eq!(
+            commands[2],
+            "sudo ip -6 route replace local 2001:470:f41e::/48 dev lo table local"
+        );
+        assert!(
+            plan.systemd_unit(Some("tt.service"))
+                .contains("Before=tt.service")
+        );
     }
 
     #[test]

@@ -34,20 +34,28 @@ cp config.toml.example config.toml
 
 ```bash
 he-router --config config.toml check
+he-router --config config.toml prepare
+he-router --config config.toml prepare --systemd --before-service tt.service
 he-router --config config.toml derive --account-id acct_1 --access-token token
+he-router --config config.toml --json derive --account-id acct_1 --access-token token
 he-router --config config.toml smoke \
   --account-id acct_1 \
   --access-token token \
   --target-ipv6 2606:4700:4400::ac40:9bd1
 ```
 
+`prepare` is safe by default: it prints the exact sysctl/route commands instead
+of mutating the host. Use `prepare --apply` only from a privileged deployment
+step. Use `prepare --systemd` to generate a oneshot unit.
+
 ## Library sketch
 
 ```rust
 use std::time::Duration;
-use he_router::{HeRouter, HeRouterConfig, RouteRequest, TlsBackend};
+use he_router::{kernel_prepare_plan, HeRouter, HeRouterConfig, RouteRequest, TlsBackend};
 
 let config = HeRouterConfig::load_from("config.toml")?;
+let plan = kernel_prepare_plan(&config)?;
 let router = HeRouter::new(config)?;
 let decision = router.route(RouteRequest {
     account_id: "account-1",
