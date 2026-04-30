@@ -34,6 +34,13 @@ cp config.toml.example config.toml
 
 ## CLI examples
 
+The CLI is behind the `cli` feature so library consumers do not inherit CLI-only
+dependencies:
+
+```bash
+cargo run --features cli -- --config config.toml prepare
+```
+
 ```bash
 he-router --config config.toml check
 he-router --config config.toml prepare
