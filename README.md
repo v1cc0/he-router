@@ -10,6 +10,8 @@ It packages the reusable part of TT's native magic access work:
 - derive a stable source IPv6 from account/token material
 - build/cache `reqwest::Client` values with `ClientBuilder::local_address(...)`
 - expose a minimal CLI while keeping the library integration-first
+- preserve app-specific routing identity by overriding `binding_namespace` or
+  constructing `HeRouter::with_salt_material(...)`
 
 ## Kernel setup
 

@@ -10,6 +10,7 @@ mode = "native-nonlocal-bind"
 ipv6_prefix = "2001:470:f41e::/48"
 manage_kernel = false
 require_kernel_ready = true
+binding_namespace = "he-router"
 binding_scope = "access-token"
 binding_salt = ""
 binding_ttl_grace_seconds = 120

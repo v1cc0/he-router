@@ -67,6 +67,7 @@ pub struct HeRouterConfig {
     pub ipv6_prefix: String,
     pub manage_kernel: bool,
     pub require_kernel_ready: bool,
+    pub binding_namespace: String,
     pub binding_scope: BindingScope,
     pub binding_salt: String,
     pub binding_ttl_grace_seconds: u64,
@@ -84,6 +85,7 @@ impl Default for HeRouterConfig {
             ipv6_prefix: String::new(),
             manage_kernel: false,
             require_kernel_ready: true,
+            binding_namespace: "he-router".to_string(),
             binding_scope: BindingScope::AccessToken,
             binding_salt: String::new(),
             binding_ttl_grace_seconds: 120,
@@ -117,6 +119,12 @@ impl HeRouterConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.binding_namespace.trim().is_empty() {
+            return Err(HeRouterError::Config(
+                "binding_namespace must not be empty".to_string(),
+            ));
+        }
+
         if !self.ipv6_prefix.trim().is_empty() {
             self.parsed_prefix()?;
         }
@@ -363,6 +371,22 @@ pub struct HeRouter {
 
 impl HeRouter {
     pub fn new(config: HeRouterConfig) -> Result<Self> {
+        Self::with_optional_salt_material(config, None)
+    }
+
+    pub fn with_salt_material(config: HeRouterConfig, salt_material: Vec<u8>) -> Result<Self> {
+        if salt_material.is_empty() {
+            return Err(HeRouterError::Config(
+                "salt_material must not be empty".to_string(),
+            ));
+        }
+        Self::with_optional_salt_material(config, Some(salt_material))
+    }
+
+    fn with_optional_salt_material(
+        config: HeRouterConfig,
+        salt_material: Option<Vec<u8>>,
+    ) -> Result<Self> {
         config.validate()?;
         if config.enabled && config.require_kernel_ready {
             validate_kernel_ready(&config)?;
@@ -372,7 +396,7 @@ impl HeRouter {
         } else {
             None
         };
-        let salt_material = salt_material(&config, prefix);
+        let salt_material = salt_material.unwrap_or_else(|| default_salt_material(&config, prefix));
 
         Ok(Self {
             config,
@@ -455,8 +479,12 @@ impl HeRouter {
         upstream_url: Option<&str>,
         prefix: Ipv6Prefix,
     ) -> Result<Option<ResolvedBinding>> {
-        let Some(binding_material) =
-            binding_material(self.config.binding_scope, account_id, access_token)?
+        let Some(binding_material) = binding_material(
+            self.config.binding_namespace.as_str(),
+            self.config.binding_scope,
+            account_id,
+            access_token,
+        )?
         else {
             return Ok(None);
         };
@@ -648,10 +676,17 @@ fn run_checked(program: &str, args: &[&str]) -> Result<()> {
 }
 
 fn binding_material(
+    binding_namespace: &str,
     binding_scope: BindingScope,
     account_id: &str,
     access_token: Option<&str>,
 ) -> Result<Option<String>> {
+    let binding_namespace = binding_namespace.trim();
+    if binding_namespace.is_empty() {
+        return Err(HeRouterError::Config(
+            "binding_namespace must not be empty".to_string(),
+        ));
+    }
     let account_id = account_id.trim();
     if account_id.is_empty() {
         return Err(HeRouterError::Config(
@@ -667,9 +702,9 @@ fn binding_material(
             else {
                 return Ok(None);
             };
-            Ok(Some(format!("he-router:{account_id}:{token}")))
+            Ok(Some(format!("{binding_namespace}:{account_id}:{token}")))
         }
-        BindingScope::Account => Ok(Some(format!("he-router:{account_id}:account"))),
+        BindingScope::Account => Ok(Some(format!("{binding_namespace}:{account_id}:account"))),
     }
 }
 
@@ -751,7 +786,7 @@ fn upstream_origin(raw_url: &str) -> Result<String> {
     Ok(format!("{scheme}://{host}:{port}"))
 }
 
-fn salt_material(config: &HeRouterConfig, prefix: Option<Ipv6Prefix>) -> Vec<u8> {
+fn default_salt_material(config: &HeRouterConfig, prefix: Option<Ipv6Prefix>) -> Vec<u8> {
     let salt = config.binding_salt.trim();
     if !salt.is_empty() {
         return salt.as_bytes().to_vec();
@@ -974,7 +1009,26 @@ mod tests {
     fn example_config_uses_typed_toml_enums() {
         let cfg: HeRouterConfig = toml::from_str(include_str!("../config.toml.example")).unwrap();
         assert_eq!(cfg.mode, HeRouterMode::NativeNonlocalBind);
+        assert_eq!(cfg.binding_namespace, "he-router");
         assert_eq!(cfg.binding_scope, BindingScope::AccessToken);
+    }
+
+    #[test]
+    fn namespace_and_raw_salt_material_preserve_legacy_derivation() {
+        let mut cfg = config();
+        cfg.binding_namespace = "openai".to_string();
+        cfg.binding_salt.clear();
+        let salt_material = Sha256::digest(b"tt:magic-access:auth-secret").to_vec();
+        let router = HeRouter::with_salt_material(cfg.clone(), salt_material.clone()).unwrap();
+        let source_ip = router
+            .derive_source_ip("42", Some("token-a"))
+            .unwrap()
+            .unwrap();
+
+        let prefix: Ipv6Prefix = cfg.ipv6_prefix.parse().unwrap();
+        let binding_digest = Sha256::digest(b"openai:42:token-a");
+        let expected = derive_source_ipv6(prefix, &salt_material, &binding_digest);
+        assert_eq!(source_ip, expected);
     }
 
     #[test]
