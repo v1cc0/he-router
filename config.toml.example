@@ -1,0 +1,19 @@
+# he-router example config
+#
+# Kernel preparation is intentionally external to this crate:
+#   sudo sysctl -w net.ipv6.ip_nonlocal_bind=1
+#   sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
+#   sudo ip -6 route replace local 2001:470:f41e::/48 dev lo table local
+
+enabled = true
+mode = "native-nonlocal-bind"
+ipv6_prefix = "2001:470:f41e::/48"
+manage_kernel = false
+require_kernel_ready = true
+binding_scope = "access-token"
+binding_salt = ""
+binding_ttl_grace_seconds = 120
+max_client_cache_entries = 512
+client_idle_timeout_seconds = 90
+allow_proxy = false
+log_decisions = false
