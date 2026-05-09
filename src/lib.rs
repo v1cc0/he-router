@@ -15,16 +15,22 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, HeRouterError>;
 
+pub mod remote;
+
 #[derive(Debug, Error)]
 pub enum HeRouterError {
     #[error("config error: {0}")]
     Config(String),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("TOML decode error: {0}")]
     TomlDe(#[from] toml::de::Error),
     #[error("TOML encode error: {0}")]
     TomlSer(#[from] toml::ser::Error),
+    #[error("protocol error: {0}")]
+    Protocol(String),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -1,10 +1,10 @@
-use std::net::Ipv6Addr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use he_router::{
-    HeRouter, HeRouterConfig, RouteRequest, TlsBackend, bind_dry_run, kernel_prepare_plan,
+    HeRouter, HeRouterConfig, RouteRequest, TlsBackend, bind_dry_run, kernel_prepare_plan, remote,
     route_get, validate_kernel_ready,
 };
 use serde_json::json;
@@ -60,9 +60,37 @@ enum Command {
         #[arg(long)]
         target_ipv6: Option<Ipv6Addr>,
     },
+    /// Run the remote QUIC proxy server on a HE-enabled VPS.
+    Server {
+        #[arg(long, default_value = "[::]:7443")]
+        listen: SocketAddr,
+        #[arg(long)]
+        cert: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        auth_token: String,
+    },
+    /// Send one HTTP request through a remote he-router server using a local client config.
+    Client {
+        #[arg(long, default_value = "GET")]
+        method: String,
+        #[arg(long)]
+        url: String,
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// Write an example remote client config for local auth/tunnel usage.
+    InitClientConfig {
+        #[arg(long)]
+        force: bool,
+    },
 }
 
-fn main() -> he_router::Result<()> {
+#[tokio::main]
+async fn main() -> he_router::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init { force } => {
@@ -237,6 +265,75 @@ fn main() -> he_router::Result<()> {
                 }
             }
         }
+        Command::Server {
+            listen,
+            cert,
+            key,
+            auth_token,
+        } => {
+            let options = remote::RemoteServerOptions {
+                listen,
+                cert_path: cert,
+                key_path: key,
+                auth_token,
+            };
+            remote::run_server(&cli.config, options).await?;
+        }
+        Command::Client {
+            method,
+            url,
+            headers,
+            body,
+        } => {
+            let headers = parse_header_args(headers)?;
+            let response = remote::run_client_command(
+                &cli.config,
+                remote::ClientCommandOptions {
+                    method,
+                    url,
+                    headers,
+                    body: body.unwrap_or_default().into_bytes(),
+                },
+            )
+            .await?;
+            if cli.json {
+                print_json(json!({
+                    "status": response.status,
+                    "headers": response.headers,
+                    "body": String::from_utf8_lossy(&response.body),
+                    "source_ip": response.source_ip,
+                    "error": response.error,
+                }))?;
+            } else {
+                println!("status={}", response.status);
+                if let Some(source_ip) = response.source_ip {
+                    println!("source_ip={source_ip}");
+                }
+                if let Some(error) = response.error {
+                    println!("error={error}");
+                }
+                for header in response.headers {
+                    println!("header:{}={}", header.name, header.value);
+                }
+                if !response.body.is_empty() {
+                    println!("{}", String::from_utf8_lossy(&response.body));
+                }
+            }
+        }
+        Command::InitClientConfig { force } => {
+            if cli.config.exists() && !force {
+                return Err(he_router::HeRouterError::Config(format!(
+                    "{} already exists; pass --force to overwrite",
+                    cli.config.display()
+                )));
+            }
+            remote::RemoteClientConfig::write_example(&cli.config)?;
+            if cli.json {
+                print_json(json!({ "written": cli.config.display().to_string() }))?;
+            } else {
+                println!("wrote {}", cli.config.display());
+            }
+        }
     }
     Ok(())
 }
@@ -247,4 +344,17 @@ fn print_json(value: serde_json::Value) -> he_router::Result<()> {
     })?;
     println!("{raw}");
     Ok(())
+}
+
+fn parse_header_args(values: Vec<String>) -> he_router::Result<Vec<(String, String)>> {
+    let mut headers = Vec::new();
+    for value in values {
+        let Some((name, header_value)) = value.split_once(':') else {
+            return Err(he_router::HeRouterError::Config(format!(
+                "invalid --header {value:?}; expected name:value"
+            )));
+        };
+        headers.push((name.trim().to_string(), header_value.trim().to_string()));
+    }
+    Ok(headers)
 }

@@ -1,0 +1,241 @@
+use std::fs;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn::rustls;
+use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use serde::{Deserialize, Serialize};
+
+use crate::{HeRouter, HeRouterConfig, HeRouterError, Result};
+
+mod client;
+mod server;
+
+pub use client::{ClientCommandOptions, RemoteTunnelClient, run_client_command};
+pub use server::{RemoteServerOptions, run_server};
+
+pub const ALPN_HE_ROUTER: &[u8] = b"he-router/1";
+pub const MAX_PROXY_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeaderPair {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteHttpRequest {
+    pub request_id: String,
+    pub auth_token: String,
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<HeaderPair>,
+    pub body: Vec<u8>,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteHttpResponse {
+    pub status: u16,
+    pub headers: Vec<HeaderPair>,
+    pub body: Vec<u8>,
+    pub source_ip: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RemoteClientConfig {
+    pub server_addr: String,
+    pub server_name: String,
+    pub auth_token: String,
+    pub ca_cert_path: PathBuf,
+    pub bind_addr: String,
+    pub request_timeout_seconds: u64,
+}
+
+impl Default for RemoteClientConfig {
+    fn default() -> Self {
+        Self {
+            server_addr: "127.0.0.1:7443".to_string(),
+            server_name: "localhost".to_string(),
+            auth_token: String::new(),
+            ca_cert_path: PathBuf::from("ca-cert.pem"),
+            bind_addr: "[::]:0".to_string(),
+            request_timeout_seconds: 60,
+        }
+    }
+}
+
+impl RemoteClientConfig {
+    pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
+        let raw = fs::read_to_string(path)?;
+        let config: Self = toml::from_str(&raw)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.server_addr.trim().is_empty() {
+            return Err(HeRouterError::Config(
+                "remote client server_addr must not be empty".to_string(),
+            ));
+        }
+        if self.server_name.trim().is_empty() {
+            return Err(HeRouterError::Config(
+                "remote client server_name must not be empty".to_string(),
+            ));
+        }
+        if self.auth_token.trim().is_empty() {
+            return Err(HeRouterError::Config(
+                "remote client auth_token must not be empty".to_string(),
+            ));
+        }
+        if self.request_timeout_seconds == 0 {
+            return Err(HeRouterError::Config(
+                "remote client request_timeout_seconds must be > 0".to_string(),
+            ));
+        }
+        if self.bind_addr.trim().parse::<SocketAddr>().is_err() {
+            return Err(HeRouterError::Config(format!(
+                "invalid remote client bind_addr {}",
+                self.bind_addr
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn bind_addr(&self) -> Result<SocketAddr> {
+        self.bind_addr
+            .parse()
+            .map_err(|err| HeRouterError::Config(format!("invalid remote client bind_addr: {err}")))
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_secs(self.request_timeout_seconds)
+    }
+
+    pub fn write_example(path: impl AsRef<Path>) -> Result<()> {
+        fs::write(path, include_str!("../../remote-client.toml.example"))?;
+        Ok(())
+    }
+}
+
+pub fn request_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("req-{nanos}")
+}
+
+pub fn server_router_config(config: &HeRouterConfig) -> HeRouterConfig {
+    let mut config = config.clone();
+    config.binding_scope = crate::BindingScope::Account;
+    if config.binding_namespace == "he-router" {
+        config.binding_namespace = "he-router-remote".to_string();
+    }
+    config
+}
+
+pub fn build_server_config(cert_path: &Path, key_path: &Path) -> Result<quinn::ServerConfig> {
+    let key_raw = fs::read(key_path)?;
+    let key = if key_path.extension().is_some_and(|ext| ext == "der") {
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_raw))
+    } else {
+        rustls_pemfile::private_key(&mut &*key_raw)
+            .map_err(|err| HeRouterError::Protocol(format!("invalid private key: {err}")))?
+            .ok_or_else(|| HeRouterError::Config("no private key found".to_string()))?
+    };
+
+    let cert_raw = fs::read(cert_path)?;
+    let certs = if cert_path.extension().is_some_and(|ext| ext == "der") {
+        vec![CertificateDer::from(cert_raw)]
+    } else {
+        rustls_pemfile::certs(&mut &*cert_raw)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|err| HeRouterError::Protocol(format!("invalid certificate: {err}")))?
+    };
+
+    let mut server_crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| {
+            HeRouterError::Protocol(format!("failed building rustls server config: {err}"))
+        })?;
+    server_crypto.alpn_protocols = vec![ALPN_HE_ROUTER.to_vec()];
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(server_crypto).map_err(|err| {
+            HeRouterError::Protocol(format!("failed building QUIC server config: {err}"))
+        })?,
+    ));
+    if let Some(transport) = Arc::get_mut(&mut server_config.transport) {
+        transport.max_concurrent_uni_streams(0_u8.into());
+    }
+    Ok(server_config)
+}
+
+pub fn build_client_config(client: &RemoteClientConfig) -> Result<quinn::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    let cert_raw = fs::read(&client.ca_cert_path)?;
+    if client
+        .ca_cert_path
+        .extension()
+        .is_some_and(|ext| ext == "der")
+    {
+        roots
+            .add(CertificateDer::from(cert_raw))
+            .map_err(|err| HeRouterError::Protocol(format!("failed adding CA cert: {err}")))?;
+    } else {
+        for cert in rustls_pemfile::certs(&mut &*cert_raw) {
+            let cert =
+                cert.map_err(|err| HeRouterError::Protocol(format!("invalid CA cert: {err}")))?;
+            roots
+                .add(cert)
+                .map_err(|err| HeRouterError::Protocol(format!("failed adding CA cert: {err}")))?;
+        }
+    }
+
+    let mut client_crypto = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_crypto.alpn_protocols = vec![ALPN_HE_ROUTER.to_vec()];
+
+    Ok(quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(client_crypto).map_err(|err| {
+            HeRouterError::Protocol(format!("failed building QUIC client config: {err}"))
+        })?,
+    )))
+}
+
+pub fn map_async_error(label: &str, err: impl std::fmt::Display) -> HeRouterError {
+    HeRouterError::Protocol(format!("{label}: {err}"))
+}
+
+pub fn build_server_router(config_path: &Path) -> Result<HeRouter> {
+    let config = HeRouterConfig::load_from(config_path)?;
+    HeRouter::new(server_router_config(&config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_client_config_defaults_are_valid() {
+        let config = RemoteClientConfig {
+            auth_token: "token".to_string(),
+            ..RemoteClientConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn request_ids_have_prefix() {
+        assert!(request_id().starts_with("req-"));
+    }
+}
