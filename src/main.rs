@@ -62,14 +62,14 @@ enum Command {
     },
     /// Run the remote QUIC proxy server on a HE-enabled VPS.
     Server {
-        #[arg(long, default_value = "[::]:7443")]
-        listen: SocketAddr,
         #[arg(long)]
-        cert: PathBuf,
+        listen: Option<SocketAddr>,
         #[arg(long)]
-        key: PathBuf,
+        cert: Option<PathBuf>,
         #[arg(long)]
-        auth_token: String,
+        key: Option<PathBuf>,
+        #[arg(long)]
+        auth_token: Option<String>,
     },
     /// Send one HTTP request through a remote he-router server using a local client config.
     Client {
@@ -271,12 +271,20 @@ async fn main() -> he_router::Result<()> {
             key,
             auth_token,
         } => {
-            let options = remote::RemoteServerOptions {
-                listen,
-                cert_path: cert,
-                key_path: key,
-                auth_token,
-            };
+            let cfg = HeRouterConfig::load_from(&cli.config)?;
+            let mut options = remote::server_options_from_embedded(&cfg.server)?;
+            if let Some(listen) = listen {
+                options.listen = listen;
+            }
+            if let Some(cert) = cert {
+                options.cert_path = cert;
+            }
+            if let Some(key) = key {
+                options.key_path = key;
+            }
+            if let Some(auth_token) = auth_token {
+                options.auth_token = auth_token;
+            }
             remote::run_server(&cli.config, options).await?;
         }
         Command::Client {

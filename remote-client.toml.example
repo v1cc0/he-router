@@ -1,6 +1,7 @@
+[client]
 server_addr = "your-vps.example.com:7443"
 server_name = "your-vps.example.com"
-auth_token = "replace-with-a-strong-shared-secret"
+auth-token = "replace-with-a-strong-shared-secret"
 ca_cert_path = "/path/to/server-cert.pem"
 bind_addr = "[::]:0"
 request_timeout_seconds = 60

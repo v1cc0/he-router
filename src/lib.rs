@@ -81,6 +81,8 @@ pub struct HeRouterConfig {
     pub client_idle_timeout_seconds: u64,
     pub allow_proxy: bool,
     pub log_decisions: bool,
+    pub server: EmbeddedServerConfig,
+    pub client: EmbeddedClientConfig,
 }
 
 impl Default for HeRouterConfig {
@@ -99,6 +101,8 @@ impl Default for HeRouterConfig {
             client_idle_timeout_seconds: 90,
             allow_proxy: false,
             log_decisions: false,
+            server: EmbeddedServerConfig::default(),
+            client: EmbeddedClientConfig::default(),
         }
     }
 }
@@ -158,6 +162,28 @@ impl HeRouterConfig {
     fn parsed_prefix(&self) -> Result<Ipv6Prefix> {
         self.ipv6_prefix.parse()
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddedServerConfig {
+    pub listen_port: String,
+    pub cert: String,
+    pub key: String,
+    #[serde(rename = "auth-token", alias = "auth_token")]
+    pub auth_token: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddedClientConfig {
+    pub server_addr: String,
+    pub server_name: String,
+    #[serde(rename = "auth-token", alias = "auth_token")]
+    pub auth_token: String,
+    pub ca_cert_path: String,
+    pub bind_addr: String,
+    pub request_timeout_seconds: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1017,6 +1043,8 @@ mod tests {
         assert_eq!(cfg.mode, HeRouterMode::NativeNonlocalBind);
         assert_eq!(cfg.binding_namespace, "he-router");
         assert_eq!(cfg.binding_scope, BindingScope::AccessToken);
+        assert_eq!(cfg.server.listen_port, "[::]:7443");
+        assert_eq!(cfg.client.server_addr, "your-vps.example.com:7443");
     }
 
     #[test]

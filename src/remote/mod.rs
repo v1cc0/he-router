@@ -9,7 +9,9 @@ use quinn::rustls;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 
-use crate::{HeRouter, HeRouterConfig, HeRouterError, Result};
+use crate::{
+    EmbeddedClientConfig, EmbeddedServerConfig, HeRouter, HeRouterConfig, HeRouterError, Result,
+};
 
 mod client;
 mod server;
@@ -72,10 +74,8 @@ impl Default for RemoteClientConfig {
 
 impl RemoteClientConfig {
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
-        let raw = fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&raw)?;
-        config.validate()?;
-        Ok(config)
+        let config = HeRouterConfig::load_from(path)?;
+        Self::from_embedded(&config.client)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -106,6 +106,31 @@ impl RemoteClientConfig {
             )));
         }
         Ok(())
+    }
+
+    pub fn from_embedded(config: &EmbeddedClientConfig) -> Result<Self> {
+        let config = Self {
+            server_addr: config.server_addr.clone(),
+            server_name: config.server_name.clone(),
+            auth_token: config.auth_token.clone(),
+            ca_cert_path: if config.ca_cert_path.trim().is_empty() {
+                PathBuf::from("ca-cert.pem")
+            } else {
+                PathBuf::from(config.ca_cert_path.trim())
+            },
+            bind_addr: if config.bind_addr.trim().is_empty() {
+                "[::]:0".to_string()
+            } else {
+                config.bind_addr.clone()
+            },
+            request_timeout_seconds: if config.request_timeout_seconds == 0 {
+                60
+            } else {
+                config.request_timeout_seconds
+            },
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn bind_addr(&self) -> Result<SocketAddr> {
@@ -139,6 +164,26 @@ pub fn server_router_config(config: &HeRouterConfig) -> HeRouterConfig {
         config.binding_namespace = "he-router-remote".to_string();
     }
     config
+}
+
+pub fn server_options_from_embedded(config: &EmbeddedServerConfig) -> Result<RemoteServerOptions> {
+    let listen = if config.listen_port.trim().is_empty() {
+        "[::]:7443".parse().map_err(|err| {
+            HeRouterError::Config(format!("invalid default server listen_port: {err}"))
+        })?
+    } else {
+        config
+            .listen_port
+            .parse()
+            .map_err(|err| HeRouterError::Config(format!("invalid server listen_port: {err}")))?
+    };
+
+    Ok(RemoteServerOptions {
+        listen,
+        cert_path: PathBuf::from(config.cert.trim()),
+        key_path: PathBuf::from(config.key.trim()),
+        auth_token: config.auth_token.trim().to_string(),
+    })
 }
 
 pub fn build_server_config(cert_path: &Path, key_path: &Path) -> Result<quinn::ServerConfig> {
@@ -237,5 +282,14 @@ mod tests {
     #[test]
     fn request_ids_have_prefix() {
         assert!(request_id().starts_with("req-"));
+    }
+
+    #[test]
+    fn remote_client_example_parses_from_client_section() {
+        let path = std::env::temp_dir().join(format!("he-router-client-{}.toml", request_id()));
+        fs::write(&path, include_str!("../../remote-client.toml.example")).unwrap();
+        let parsed = RemoteClientConfig::load_from(&path).unwrap();
+        assert_eq!(parsed.server_addr, "your-vps.example.com:7443");
+        let _ = fs::remove_file(path);
     }
 }

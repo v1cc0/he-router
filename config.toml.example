@@ -18,3 +18,17 @@ max_client_cache_entries = 512
 client_idle_timeout_seconds = 90
 allow_proxy = false
 log_decisions = false
+
+[server]
+listen_port = "[::]:7443"
+cert = "/data/he-router/server-cert.pem"
+key = "/data/he-router/server-key.pem"
+auth-token = "replace-with-a-strong-shared-secret"
+
+[client]
+server_addr = "your-vps.example.com:7443"
+server_name = "your-vps.example.com"
+auth-token = "replace-with-a-strong-shared-secret"
+ca_cert_path = "/path/to/server-cert.pem"
+bind_addr = "[::]:0"
+request_timeout_seconds = 60

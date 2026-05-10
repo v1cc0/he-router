@@ -32,6 +32,24 @@ he-router --config config.toml init
 cp config.toml.example config.toml
 ```
 
+The same `config.toml` can now also carry appended remote tunnel settings:
+
+```toml
+[server]
+listen_port = "[::]:7443"
+cert = "/data/he-router/server-cert.pem"
+key = "/data/he-router/server-key.pem"
+auth-token = "replace-with-a-strong-shared-secret"
+
+[client]
+server_addr = "your-vps.example.com:7443"
+server_name = "your-vps.example.com"
+auth-token = "replace-with-a-strong-shared-secret"
+ca_cert_path = "/path/to/server-cert.pem"
+bind_addr = "[::]:0"
+request_timeout_seconds = 60
+```
+
 ## CLI examples
 
 The CLI is behind the `cli` feature so library consumers do not inherit CLI-only
@@ -67,14 +85,12 @@ step. Use `prepare --systemd` to generate a oneshot unit.
 Run this on the VPS that already has the routed IPv6 prefix available:
 
 ```bash
-he-router --config /data/he-router/config.toml server \
-  --listen [::]:7443 \
-  --cert /data/he-router/server-cert.pem \
-  --key /data/he-router/server-key.pem \
-  --auth-token 'replace-with-a-strong-shared-secret'
+he-router --config /data/he-router/config.toml server
 ```
 
 The server still uses the normal `HeRouter` logic internally. In remote mode it derives a fresh binding from the request id, so requests can rotate source IPv6 addresses across the routed prefix without replacing the crate's normal direct-routing behavior.
+
+CLI flags such as `--listen`, `--cert`, `--key`, and `--auth-token` still exist and override `[server]` values when provided.
 
 ### Remote client config
 
@@ -87,9 +103,10 @@ he-router --config ./he-router.toml init-client-config --force
 Example `he-router.toml`:
 
 ```toml
+[client]
 server_addr = "your-vps.example.com:7443"
 server_name = "your-vps.example.com"
-auth_token = "replace-with-a-strong-shared-secret"
+auth-token = "replace-with-a-strong-shared-secret"
 ca_cert_path = "/path/to/server-cert.pem"
 bind_addr = "[::]:0"
 request_timeout_seconds = 60
