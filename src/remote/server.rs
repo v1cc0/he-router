@@ -77,22 +77,44 @@ async fn handle_connection(
     auth_token: String,
     incoming: quinn::Incoming,
 ) -> Result<()> {
-    let connection = incoming
-        .await
-        .map_err(|err| map_async_error("failed to accept QUIC connection", err))?;
+    let peer = incoming.remote_address();
+    let local_ip = incoming.local_ip();
+    let connection = match incoming.await {
+        Ok(connection) => connection,
+        Err(err) => {
+            eprintln!(
+                "he-router remote connection failed peer={peer} local_ip={} stage=accept_handshake reason={}",
+                format_optional_ip(local_ip),
+                describe_connection_error(&err)
+            );
+            return Ok(());
+        }
+    };
+    let connection_id = connection.stable_id();
+    eprintln!(
+        "he-router remote connection established peer={peer} conn_id={connection_id} local_ip={}",
+        format_optional_ip(local_ip)
+    );
 
     loop {
         let stream = match connection.accept_bi().await {
             Ok(stream) => stream,
-            Err(quinn::ConnectionError::ApplicationClosed { .. }) => return Ok(()),
-            Err(err) => return Err(map_async_error("failed accepting QUIC stream", err)),
+            Err(err) => {
+                eprintln!(
+                    "he-router remote connection closed peer={peer} conn_id={connection_id} stage=accept_stream reason={}",
+                    describe_connection_error(&err)
+                );
+                return Ok(());
+            }
         };
 
         let router = Arc::clone(&router);
         let auth_token = auth_token.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_stream(router, auth_token, stream).await {
-                eprintln!("he-router remote stream failed: {err}");
+            if let Err(err) = handle_stream(router, auth_token, stream, peer, connection_id).await {
+                eprintln!(
+                    "he-router remote stream failed peer={peer} conn_id={connection_id}: {err}"
+                );
             }
         });
     }
@@ -102,10 +124,16 @@ async fn handle_stream(
     router: Arc<crate::HeRouter>,
     auth_token: String,
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
+    peer: SocketAddr,
+    connection_id: usize,
 ) -> Result<()> {
     let request: RemoteHttpRequest = read_envelope(&mut recv).await?;
 
     if request.auth_token != auth_token {
+        eprintln!(
+            "he-router remote stream unauthorized peer={peer} conn_id={connection_id} request_id={} method={} target={}",
+            request.request_id, request.method, request.url
+        );
         let response = RemoteHttpResponse {
             status: 401,
             headers: Vec::new(),
@@ -121,9 +149,9 @@ async fn handle_stream(
     }
 
     if request.tunnel || request.method.eq_ignore_ascii_case("CONNECT") {
-        handle_connect_stream(router, request, send, recv).await
+        handle_connect_stream(router, request, send, recv, peer, connection_id).await
     } else {
-        let response = proxy_http_request(router.as_ref(), request).await;
+        let response = proxy_http_request(router.as_ref(), request, peer, connection_id).await;
         write_envelope(&mut send, &response).await?;
         send.finish()
             .map_err(|err| map_async_error("failed finishing QUIC response", err))?;
@@ -136,15 +164,25 @@ async fn handle_connect_stream(
     request: RemoteHttpRequest,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    peer: SocketAddr,
+    connection_id: usize,
 ) -> Result<()> {
     let source_ip = router
         .derive_source_ip(&request.request_id, None)?
         .ok_or_else(|| {
             HeRouterError::Protocol("no source IPv6 available for CONNECT tunnel".to_string())
         })?;
+    eprintln!(
+        "he-router remote assigned source IPv6 peer={peer} conn_id={connection_id} request_id={} method=CONNECT authority={} source_ip={} timeout_ms={}",
+        request.request_id, request.url, source_ip, request.timeout_ms
+    );
 
     let upstream = match connect_upstream_with_source(source_ip, &request.url).await {
         Ok((stream, used_source_ip)) => {
+            eprintln!(
+                "he-router remote CONNECT established peer={peer} conn_id={connection_id} request_id={} authority={} assigned_source_ip={} socket_local_ip={}",
+                request.request_id, request.url, source_ip, used_source_ip
+            );
             let response = RemoteHttpResponse {
                 status: 200,
                 headers: Vec::new(),
@@ -157,6 +195,10 @@ async fn handle_connect_stream(
             stream
         }
         Err(err) => {
+            eprintln!(
+                "he-router remote CONNECT failed peer={peer} conn_id={connection_id} request_id={} authority={} source_ip={} reason={err}",
+                request.request_id, request.url, source_ip
+            );
             let response = RemoteHttpResponse {
                 status: 502,
                 headers: Vec::new(),
@@ -199,6 +241,8 @@ async fn handle_connect_stream(
 async fn proxy_http_request(
     router: &crate::HeRouter,
     request: RemoteHttpRequest,
+    peer: SocketAddr,
+    connection_id: usize,
 ) -> RemoteHttpResponse {
     let timeout = std::time::Duration::from_millis(request.timeout_ms.max(1));
     let decision = match router.route(RouteRequest {
@@ -231,6 +275,15 @@ async fn proxy_http_request(
             };
         }
     };
+    eprintln!(
+        "he-router remote assigned source IPv6 peer={peer} conn_id={connection_id} request_id={} method={} url={} source_ip={} binding_key_prefix={} timeout_ms={}",
+        request.request_id,
+        request.method,
+        request.url,
+        decision.source_ip,
+        decision.binding_key_prefix,
+        request.timeout_ms
+    );
 
     let method = match Method::from_str(&request.method) {
         Ok(method) => method,
@@ -257,6 +310,10 @@ async fn proxy_http_request(
     match builder.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
+            eprintln!(
+                "he-router remote HTTP upstream responded peer={peer} conn_id={connection_id} request_id={} method={} url={} source_ip={} status={}",
+                request.request_id, request.method, request.url, decision.source_ip, status
+            );
             let headers = response
                 .headers()
                 .iter()
@@ -276,24 +333,36 @@ async fn proxy_http_request(
                     error: None,
                     tunnel_established: false,
                 },
-                Err(err) => RemoteHttpResponse {
-                    status: 502,
-                    headers: Vec::new(),
-                    body: Vec::new(),
-                    source_ip: Some(decision.source_ip.to_string()),
-                    error: Some(format!("failed to read upstream body: {err}")),
-                    tunnel_established: false,
-                },
+                Err(err) => {
+                    eprintln!(
+                        "he-router remote HTTP body read failed peer={peer} conn_id={connection_id} request_id={} method={} url={} source_ip={} reason={err}",
+                        request.request_id, request.method, request.url, decision.source_ip
+                    );
+                    RemoteHttpResponse {
+                        status: 502,
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                        source_ip: Some(decision.source_ip.to_string()),
+                        error: Some(format!("failed to read upstream body: {err}")),
+                        tunnel_established: false,
+                    }
+                }
             }
         }
-        Err(err) => RemoteHttpResponse {
-            status: 502,
-            headers: Vec::new(),
-            body: Vec::new(),
-            source_ip: Some(decision.source_ip.to_string()),
-            error: Some(format!("failed to proxy upstream request: {err}")),
-            tunnel_established: false,
-        },
+        Err(err) => {
+            eprintln!(
+                "he-router remote HTTP upstream failed peer={peer} conn_id={connection_id} request_id={} method={} url={} source_ip={} reason={err}",
+                request.request_id, request.method, request.url, decision.source_ip
+            );
+            RemoteHttpResponse {
+                status: 502,
+                headers: Vec::new(),
+                body: Vec::new(),
+                source_ip: Some(decision.source_ip.to_string()),
+                error: Some(format!("failed to proxy upstream request: {err}")),
+                tunnel_established: false,
+            }
+        }
     }
 }
 
@@ -342,5 +411,60 @@ async fn connect_candidate(source_ip: std::net::Ipv6Addr, addr: SocketAddr) -> R
             let socket = TcpSocket::new_v4().map_err(HeRouterError::Io)?;
             socket.connect(addr).await.map_err(HeRouterError::Io)
         }
+    }
+}
+
+fn format_optional_ip(ip: Option<IpAddr>) -> String {
+    ip.map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn describe_connection_error(err: &quinn::ConnectionError) -> String {
+    match err {
+        quinn::ConnectionError::VersionMismatch => {
+            "version_mismatch: peer does not support a QUIC version accepted by this server"
+                .to_string()
+        }
+        quinn::ConnectionError::TransportError(error) => format!(
+            "transport_error: code={:?} frame={:?} detail={}",
+            error.code, error.frame, error
+        ),
+        quinn::ConnectionError::ConnectionClosed(close) => format!(
+            "transport_closed_by_peer: code={:?} frame={:?} reason={}",
+            close.error_code,
+            close.frame_type,
+            String::from_utf8_lossy(&close.reason)
+        ),
+        quinn::ConnectionError::ApplicationClosed(close) => format!(
+            "application_closed_by_peer: code={} reason={}",
+            close.error_code,
+            String::from_utf8_lossy(&close.reason)
+        ),
+        quinn::ConnectionError::Reset => {
+            "reset_by_peer: peer endpoint, NAT, or network path reset the QUIC connection"
+                .to_string()
+        }
+        quinn::ConnectionError::TimedOut => {
+            "idle_timeout: no QUIC packets were received before the negotiated idle timeout; this can happen when the reusable local proxy tunnel sits idle or the network path drops UDP"
+                .to_string()
+        }
+        quinn::ConnectionError::LocallyClosed => {
+            "locally_closed: this process closed the QUIC connection".to_string()
+        }
+        quinn::ConnectionError::CidsExhausted => {
+            "cid_exhausted: not enough QUIC connection IDs were available".to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timed_out_connection_error_names_idle_reason() {
+        let detail = describe_connection_error(&quinn::ConnectionError::TimedOut);
+        assert!(detail.contains("idle_timeout"));
+        assert!(detail.contains("reusable local proxy tunnel"));
     }
 }

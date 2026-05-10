@@ -50,7 +50,7 @@ pub async fn run_client_proxy(
         })?;
         let tunnel = Arc::clone(&tunnel);
         tokio::spawn(async move {
-            if let Err(err) = handle_local_proxy_connection(stream, tunnel).await {
+            if let Err(err) = handle_local_proxy_connection(stream, tunnel, peer).await {
                 eprintln!("he-router local proxy connection from {peer} failed: {err}");
             }
         });
@@ -60,6 +60,7 @@ pub async fn run_client_proxy(
 async fn handle_local_proxy_connection(
     mut stream: tokio::net::TcpStream,
     tunnel: Arc<ReusableRemoteTunnel>,
+    peer: SocketAddr,
 ) -> Result<()> {
     let mut buffer = Vec::with_capacity(4096);
     let header_end = read_until_headers_end(&mut stream, &mut buffer).await?;
@@ -87,8 +88,8 @@ async fn handle_local_proxy_connection(
     }
 
     match request_line.method.as_str() {
-        "CONNECT" => handle_connect(stream, tunnel, request_line.target, headers).await,
-        _ => handle_http(stream, tunnel, request_line, headers, body).await,
+        "CONNECT" => handle_connect(stream, tunnel, request_line.target, headers, peer).await,
+        _ => handle_http(stream, tunnel, request_line, headers, body, peer).await,
     }
 }
 
@@ -98,18 +99,27 @@ async fn handle_http(
     request_line: ParsedRequestLine,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    peer: SocketAddr,
 ) -> Result<()> {
+    let method = request_line.method;
+    let target = request_line.target;
     let response = tunnel
         .request(super::ClientCommandOptions {
-            method: request_line.method,
-            url: request_line.target,
+            method: method.clone(),
+            url: target.clone(),
             headers: filter_forward_headers(headers),
             body,
         })
         .await?;
+    if let Some(source_ip) = response.source_ip.as_deref() {
+        eprintln!(
+            "he-router local proxy routed request peer={peer} method={method} target={target} source_ip={source_ip} status={}",
+            response.status
+        );
+    }
 
-    if let Some(error) = response.error {
-        write_error_response(&mut stream, response.status.max(500), &error).await?;
+    if let Some(error) = response.error.as_deref() {
+        write_error_response(&mut stream, response.status.max(500), error).await?;
         return Ok(());
     }
 
@@ -151,10 +161,19 @@ async fn handle_connect(
     tunnel: Arc<ReusableRemoteTunnel>,
     authority: String,
     headers: Vec<(String, String)>,
+    peer: SocketAddr,
 ) -> Result<()> {
     let (mut send, mut recv, response) = tunnel
         .open_connect_tunnel(&authority, filter_forward_headers(headers))
         .await?;
+    let source_ip = response
+        .source_ip
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    eprintln!(
+        "he-router local proxy routed request peer={peer} method=CONNECT authority={authority} source_ip={source_ip} status={}",
+        response.status
+    );
 
     if !response.tunnel_established || response.status != 200 {
         let message = response
@@ -177,9 +196,14 @@ async fn handle_connect(
         tokio::io::copy(&mut local_read, &mut send)
             .await
             .map_err(|err| {
-                HeRouterError::Protocol(format!(
-                    "failed forwarding CONNECT data to remote tunnel: {err}"
-                ))
+                tunnel_copy_error(
+                    "failed forwarding CONNECT data to remote tunnel",
+                    "remote QUIC stream closed before local client bytes were forwarded",
+                    peer,
+                    &authority,
+                    &source_ip,
+                    err,
+                )
             })?;
         send.finish().map_err(|err| {
             HeRouterError::Protocol(format!("failed finishing CONNECT send stream: {err}"))
@@ -191,9 +215,14 @@ async fn handle_connect(
         tokio::io::copy(&mut recv, &mut local_write)
             .await
             .map_err(|err| {
-                HeRouterError::Protocol(format!(
-                    "failed forwarding CONNECT data from remote tunnel: {err}"
-                ))
+                tunnel_copy_error(
+                    "failed forwarding CONNECT data from remote tunnel",
+                    "local client closed before remote tunnel bytes were written",
+                    peer,
+                    &authority,
+                    &source_ip,
+                    err,
+                )
             })?;
         local_write.shutdown().await.ok();
         Ok::<(), HeRouterError>(())
@@ -315,6 +344,46 @@ async fn write_error_response(
     Ok(())
 }
 
+fn tunnel_copy_error(
+    context: &str,
+    peer_close_hint: &str,
+    peer: SocketAddr,
+    authority: &str,
+    source_ip: &str,
+    err: std::io::Error,
+) -> HeRouterError {
+    HeRouterError::Protocol(format!(
+        "{context} peer={peer} authority={authority} source_ip={source_ip}: reason={} original={err}",
+        describe_io_error(&err, peer_close_hint)
+    ))
+}
+
+fn describe_io_error(err: &std::io::Error, peer_close_hint: &str) -> String {
+    let message = err.to_string().to_ascii_lowercase();
+    if message.contains("connection lost") {
+        return "quic_connection_lost: remote QUIC connection closed while this CONNECT tunnel was copying bytes; check the remote server log for the close reason, commonly idle_timeout or peer reset".to_string();
+    }
+    if message.contains("timed out") {
+        return "io_timeout: no bytes moved before the socket/tunnel timeout expired; the tunnel may have been idle or the network path may have dropped traffic".to_string();
+    }
+
+    match err.kind() {
+        std::io::ErrorKind::BrokenPipe => {
+            format!("broken_pipe: {peer_close_hint}")
+        }
+        std::io::ErrorKind::ConnectionReset => {
+            format!("connection_reset: {peer_close_hint}")
+        }
+        std::io::ErrorKind::UnexpectedEof => {
+            format!("unexpected_eof: {peer_close_hint}")
+        }
+        std::io::ErrorKind::TimedOut => {
+            "io_timeout: no bytes moved before the socket/tunnel timeout expired; the tunnel may have been idle or the network path may have dropped traffic".to_string()
+        }
+        _ => format!("io_error_kind={}", err.kind()),
+    }
+}
+
 fn status_text(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -341,3 +410,24 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "proxy-authorization",
     "proxy-authenticate",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broken_pipe_error_includes_close_hint() {
+        let err = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        let detail = describe_io_error(&err, "local client closed early");
+        assert!(detail.contains("broken_pipe"));
+        assert!(detail.contains("local client closed early"));
+    }
+
+    #[test]
+    fn connection_lost_error_points_to_remote_close_reason() {
+        let err = std::io::Error::other("connection lost");
+        let detail = describe_io_error(&err, "unused hint");
+        assert!(detail.contains("quic_connection_lost"));
+        assert!(detail.contains("remote server log"));
+    }
+}
