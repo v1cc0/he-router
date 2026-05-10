@@ -1,6 +1,6 @@
 [package]
 name = "he-router"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 authors = ["v1cc0 <vc@v1cc0.eu.org>"]
 description = "HE routed IPv6 source binding helper for Rust applications"
@@ -20,7 +20,12 @@ cli = ["dep:clap"]
 clap = { version = "4.6.1", features = ["derive"], optional = true }
 quinn = "0.11.9"
 rcgen = "0.14.7"
-reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls", "native-tls", "socks"] }
+reqwest = { version = "0.13.3", default-features = false, features = [
+  "json",
+  "rustls",
+  "native-tls",
+  "socks",
+] }
 rustls = { version = "0.23.40", features = ["ring"] }
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
