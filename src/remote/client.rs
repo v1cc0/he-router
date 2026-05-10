@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use tokio::sync::Mutex;
 
 use super::{
     RemoteClientConfig, RemoteHttpRequest, RemoteHttpResponse, build_client_config,
@@ -57,6 +58,80 @@ impl RemoteTunnelClient {
         let response = session.request(options).await?;
         session.close().await;
         Ok(response)
+    }
+}
+
+pub struct ReusableRemoteTunnel {
+    client: RemoteTunnelClient,
+    session: Mutex<Option<RemoteTunnelSession>>,
+}
+
+impl ReusableRemoteTunnel {
+    pub fn from_config(config: RemoteClientConfig) -> Self {
+        Self {
+            client: RemoteTunnelClient::from_config(config),
+            session: Mutex::new(None),
+        }
+    }
+
+    pub async fn request(&self, options: ClientCommandOptions) -> Result<RemoteHttpResponse> {
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let session = self.ensure_session().await?;
+            match session.request(options.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(err) if should_reconnect(&err) && attempt == 0 => {
+                    self.reset_session().await;
+                    last_error = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            HeRouterError::Protocol("request retry logic exhausted unexpectedly".to_string())
+        }))
+    }
+
+    pub async fn open_connect_tunnel(
+        &self,
+        authority: &str,
+        headers: Vec<(String, String)>,
+    ) -> Result<(SendStream, RecvStream, RemoteHttpResponse)> {
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let session = self.ensure_session().await?;
+            match session
+                .open_connect_tunnel(authority, headers.clone())
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(err) if should_reconnect(&err) && attempt == 0 => {
+                    self.reset_session().await;
+                    last_error = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            HeRouterError::Protocol("CONNECT retry logic exhausted unexpectedly".to_string())
+        }))
+    }
+
+    async fn ensure_session(&self) -> Result<RemoteTunnelSession> {
+        let mut guard = self.session.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.client.connect().await?);
+        }
+        guard
+            .clone()
+            .ok_or_else(|| HeRouterError::Protocol("session unexpectedly missing".to_string()))
+    }
+
+    async fn reset_session(&self) {
+        let session = self.session.lock().await.take();
+        if let Some(session) = session {
+            session.close().await;
+        }
     }
 }
 
@@ -156,4 +231,17 @@ fn resolve_remote(server_addr: &str) -> Result<SocketAddr> {
 
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn should_reconnect(err: &HeRouterError) -> bool {
+    match err {
+        HeRouterError::Protocol(message) => {
+            message.contains("connection lost")
+                || message.contains("failed to open QUIC stream")
+                || message.contains("ApplicationClosed")
+                || message.contains("ConnectionLost")
+                || message.contains("0-RTT rejected")
+        }
+        _ => false,
+    }
 }

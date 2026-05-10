@@ -19,7 +19,8 @@ mod proxy;
 mod server;
 
 pub use client::{
-    ClientCommandOptions, RemoteTunnelClient, RemoteTunnelSession, run_client_command,
+    ClientCommandOptions, RemoteTunnelClient, RemoteTunnelSession, ReusableRemoteTunnel,
+    run_client_command,
 };
 pub use proxy::{ClientProxyOptions, run_client_proxy};
 pub use server::{RemoteServerOptions, run_server};

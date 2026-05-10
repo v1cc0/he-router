@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use super::{RemoteClientConfig, RemoteClientProxyConfig, RemoteTunnelClient, RemoteTunnelSession};
+use super::{RemoteClientConfig, RemoteClientProxyConfig, ReusableRemoteTunnel};
 use crate::{EmbeddedClientProxyConfig, HeRouterConfig, HeRouterError, Result};
 
 #[derive(Debug, Clone)]
@@ -33,11 +33,7 @@ pub async fn run_client_proxy(
         proxy_options.listen = listen;
     }
 
-    let tunnel = Arc::new(
-        RemoteTunnelClient::from_config(client_config)
-            .connect()
-            .await?,
-    );
+    let tunnel = Arc::new(ReusableRemoteTunnel::from_config(client_config));
     let listener = TcpListener::bind(proxy_options.listen)
         .await
         .map_err(|err| {
@@ -63,7 +59,7 @@ pub async fn run_client_proxy(
 
 async fn handle_local_proxy_connection(
     mut stream: tokio::net::TcpStream,
-    tunnel: Arc<RemoteTunnelSession>,
+    tunnel: Arc<ReusableRemoteTunnel>,
 ) -> Result<()> {
     let mut buffer = Vec::with_capacity(4096);
     let header_end = read_until_headers_end(&mut stream, &mut buffer).await?;
@@ -98,7 +94,7 @@ async fn handle_local_proxy_connection(
 
 async fn handle_http(
     mut stream: tokio::net::TcpStream,
-    tunnel: Arc<RemoteTunnelSession>,
+    tunnel: Arc<ReusableRemoteTunnel>,
     request_line: ParsedRequestLine,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
@@ -152,7 +148,7 @@ async fn handle_http(
 
 async fn handle_connect(
     mut stream: tokio::net::TcpStream,
-    tunnel: Arc<RemoteTunnelSession>,
+    tunnel: Arc<ReusableRemoteTunnel>,
     authority: String,
     headers: Vec<(String, String)>,
 ) -> Result<()> {
