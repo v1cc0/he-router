@@ -2,6 +2,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -21,6 +22,7 @@ pub use server::{RemoteServerOptions, run_server};
 
 pub const ALPN_HE_ROUTER: &[u8] = b"he-router/1";
 pub const MAX_PROXY_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+static INSTALL_RUSTLS_PROVIDER: Once = Once::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeaderPair {
@@ -187,6 +189,7 @@ pub fn server_options_from_embedded(config: &EmbeddedServerConfig) -> Result<Rem
 }
 
 pub fn build_server_config(cert_path: &Path, key_path: &Path) -> Result<quinn::ServerConfig> {
+    ensure_rustls_provider_installed();
     let key_raw = fs::read(key_path)?;
     let key = if key_path.extension().is_some_and(|ext| ext == "der") {
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_raw))
@@ -225,6 +228,7 @@ pub fn build_server_config(cert_path: &Path, key_path: &Path) -> Result<quinn::S
 }
 
 pub fn build_client_config(client: &RemoteClientConfig) -> Result<quinn::ClientConfig> {
+    ensure_rustls_provider_installed();
     let mut roots = rustls::RootCertStore::empty();
     let cert_raw = fs::read(&client.ca_cert_path)?;
     if client
@@ -259,6 +263,12 @@ pub fn build_client_config(client: &RemoteClientConfig) -> Result<quinn::ClientC
 
 pub fn map_async_error(label: &str, err: impl std::fmt::Display) -> HeRouterError {
     HeRouterError::Protocol(format!("{label}: {err}"))
+}
+
+fn ensure_rustls_provider_installed() {
+    INSTALL_RUSTLS_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 pub fn build_server_router(config_path: &Path) -> Result<HeRouter> {
