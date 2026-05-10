@@ -48,6 +48,9 @@ auth-token = "replace-with-a-strong-shared-secret"
 ca_cert_path = "/path/to/server-cert.pem"
 bind_addr = "[::]:0"
 request_timeout_seconds = 60
+
+[client_proxy]
+listen = "127.0.0.1:8787"
 ```
 
 ## CLI examples
@@ -123,6 +126,22 @@ he-router --config ./he-router.toml client \
 ```
 
 This uses one QUIC bidirectional stream per proxied request, which keeps the transport Hysteria2-like without replacing the core crate API.
+
+### Local proxy mode
+
+Expose a local HTTP/CONNECT proxy that reuses the remote QUIC tunnel:
+
+```bash
+he-router --config ./he-router.toml client-proxy
+```
+
+Override the listen address if needed:
+
+```bash
+he-router --config ./he-router.toml client-proxy --listen 127.0.0.1:9878
+```
+
+This is the intended mode for browser/app integration. The local proxy keeps one QUIC connection open to the VPS and opens a fresh QUIC bidirectional stream per proxied request or CONNECT tunnel.
 
 ## Library sketch
 

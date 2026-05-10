@@ -5,19 +5,23 @@ use std::sync::Arc;
 use std::sync::Once;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::{
+    EmbeddedClientConfig, EmbeddedClientProxyConfig, EmbeddedServerConfig, HeRouter,
+    HeRouterConfig, HeRouterError, Result,
+};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    EmbeddedClientConfig, EmbeddedServerConfig, HeRouter, HeRouterConfig, HeRouterError, Result,
-};
-
 mod client;
+mod proxy;
 mod server;
 
-pub use client::{ClientCommandOptions, RemoteTunnelClient, run_client_command};
+pub use client::{
+    ClientCommandOptions, RemoteTunnelClient, RemoteTunnelSession, run_client_command,
+};
+pub use proxy::{ClientProxyOptions, run_client_proxy};
 pub use server::{RemoteServerOptions, run_server};
 
 pub const ALPN_HE_ROUTER: &[u8] = b"he-router/1";
@@ -39,6 +43,7 @@ pub struct RemoteHttpRequest {
     pub headers: Vec<HeaderPair>,
     pub body: Vec<u8>,
     pub timeout_ms: u64,
+    pub tunnel: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +53,7 @@ pub struct RemoteHttpResponse {
     pub body: Vec<u8>,
     pub source_ip: Option<String>,
     pub error: Option<String>,
+    pub tunnel_established: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +65,12 @@ pub struct RemoteClientConfig {
     pub ca_cert_path: PathBuf,
     pub bind_addr: String,
     pub request_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RemoteClientProxyConfig {
+    pub listen: String,
 }
 
 impl Default for RemoteClientConfig {
@@ -148,6 +160,24 @@ impl RemoteClientConfig {
     pub fn write_example(path: impl AsRef<Path>) -> Result<()> {
         fs::write(path, include_str!("../../remote-client.toml.example"))?;
         Ok(())
+    }
+}
+
+impl RemoteClientProxyConfig {
+    pub fn from_embedded(config: &EmbeddedClientProxyConfig) -> Self {
+        Self {
+            listen: if config.listen.trim().is_empty() {
+                "127.0.0.1:8787".to_string()
+            } else {
+                config.listen.clone()
+            },
+        }
+    }
+
+    pub fn listen_addr(&self) -> Result<SocketAddr> {
+        self.listen.parse().map_err(|err| {
+            HeRouterError::Config(format!("invalid remote client proxy listen address: {err}"))
+        })
     }
 }
 
@@ -265,6 +295,43 @@ pub fn map_async_error(label: &str, err: impl std::fmt::Display) -> HeRouterErro
     HeRouterError::Protocol(format!("{label}: {err}"))
 }
 
+pub async fn write_envelope<T>(send: &mut quinn::SendStream, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let payload = serde_json::to_vec(value)?;
+    let length = u32::try_from(payload.len())
+        .map_err(|_| HeRouterError::Protocol("control envelope too large to encode".to_string()))?;
+    send.write_all(&length.to_be_bytes())
+        .await
+        .map_err(|err| map_async_error("failed writing envelope length", err))?;
+    send.write_all(&payload)
+        .await
+        .map_err(|err| map_async_error("failed writing envelope payload", err))?;
+    Ok(())
+}
+
+pub async fn read_envelope<T>(recv: &mut quinn::RecvStream) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut header = [0u8; 4];
+    recv.read_exact(&mut header)
+        .await
+        .map_err(|err| map_async_error("failed reading envelope length", err))?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length > MAX_PROXY_MESSAGE_BYTES {
+        return Err(HeRouterError::Protocol(format!(
+            "control envelope length {length} exceeds safety limit"
+        )));
+    }
+    let mut payload = vec![0u8; length];
+    recv.read_exact(&mut payload)
+        .await
+        .map_err(|err| map_async_error("failed reading envelope payload", err))?;
+    Ok(serde_json::from_slice(&payload)?)
+}
+
 fn ensure_rustls_provider_installed() {
     INSTALL_RUSTLS_PROVIDER.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -300,6 +367,23 @@ mod tests {
         fs::write(&path, include_str!("../../remote-client.toml.example")).unwrap();
         let parsed = RemoteClientConfig::load_from(&path).unwrap();
         assert_eq!(parsed.server_addr, "your-vps.example.com:7443");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn remote_client_proxy_defaults_to_local_listener() {
+        let proxy = RemoteClientProxyConfig::from_embedded(&EmbeddedClientProxyConfig::default());
+        assert_eq!(proxy.listen, "127.0.0.1:8787");
+    }
+
+    #[test]
+    fn remote_client_example_includes_proxy_section() {
+        let path =
+            std::env::temp_dir().join(format!("he-router-client-proxy-{}.toml", request_id()));
+        fs::write(&path, include_str!("../../remote-client.toml.example")).unwrap();
+        let full: HeRouterConfig = HeRouterConfig::load_from(&path).unwrap();
+        let proxy = RemoteClientProxyConfig::from_embedded(&full.client_proxy);
+        assert_eq!(proxy.listen, "127.0.0.1:8787");
         let _ = fs::remove_file(path);
     }
 }

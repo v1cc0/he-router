@@ -32,3 +32,6 @@ auth-token = "replace-with-a-strong-shared-secret"
 ca_cert_path = "/path/to/server-cert.pem"
 bind_addr = "[::]:0"
 request_timeout_seconds = 60
+
+[client_proxy]
+listen = "127.0.0.1:8787"

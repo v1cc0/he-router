@@ -82,6 +82,11 @@ enum Command {
         #[arg(long)]
         body: Option<String>,
     },
+    /// Run a local HTTP/CONNECT proxy that forwards over the remote QUIC tunnel.
+    ClientProxy {
+        #[arg(long)]
+        listen: Option<SocketAddr>,
+    },
     /// Write an example remote client config for local auth/tunnel usage.
     InitClientConfig {
         #[arg(long)]
@@ -327,6 +332,9 @@ async fn main() -> he_router::Result<()> {
                     println!("{}", String::from_utf8_lossy(&response.body));
                 }
             }
+        }
+        Command::ClientProxy { listen } => {
+            remote::run_client_proxy(&cli.config, listen).await?;
         }
         Command::InitClientConfig { force } => {
             if cli.config.exists() && !force {

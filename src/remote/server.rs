@@ -1,16 +1,18 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use quinn::Endpoint;
 use reqwest::Method;
+use tokio::io::{AsyncWriteExt, copy};
+use tokio::net::{TcpSocket, TcpStream, lookup_host};
 
 use super::{
     RemoteHttpRequest, RemoteHttpResponse, build_server_config, build_server_router,
-    map_async_error,
+    map_async_error, read_envelope, write_envelope,
 };
-use crate::{Result, RouteRequest, TlsBackend};
+use crate::{HeRouterError, Result, RouteRequest, TlsBackend};
 
 #[derive(Debug, Clone)]
 pub struct RemoteServerOptions {
@@ -101,37 +103,103 @@ async fn handle_stream(
     auth_token: String,
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
 ) -> Result<()> {
-    let request_bytes = recv
-        .read_to_end(super::MAX_PROXY_MESSAGE_BYTES)
-        .await
-        .map_err(|err| map_async_error("failed reading QUIC request", err))?;
-    let request: RemoteHttpRequest = serde_json::from_slice(&request_bytes)?;
+    let request: RemoteHttpRequest = read_envelope(&mut recv).await?;
 
-    let response = proxy_request(router.as_ref(), &auth_token, request).await;
-    let payload = serde_json::to_vec(&response)?;
-    send.write_all(&payload)
-        .await
-        .map_err(|err| map_async_error("failed writing QUIC response", err))?;
-    send.finish()
-        .map_err(|err| map_async_error("failed finishing QUIC response", err))?;
-    Ok(())
-}
-
-async fn proxy_request(
-    router: &crate::HeRouter,
-    expected_auth_token: &str,
-    request: RemoteHttpRequest,
-) -> RemoteHttpResponse {
-    if request.auth_token != expected_auth_token {
-        return RemoteHttpResponse {
+    if request.auth_token != auth_token {
+        let response = RemoteHttpResponse {
             status: 401,
             headers: Vec::new(),
             body: Vec::new(),
             source_ip: None,
             error: Some("unauthorized".to_string()),
+            tunnel_established: false,
         };
+        write_envelope(&mut send, &response).await?;
+        send.finish()
+            .map_err(|err| map_async_error("failed finishing unauthorized response", err))?;
+        return Ok(());
     }
 
+    if request.tunnel || request.method.eq_ignore_ascii_case("CONNECT") {
+        handle_connect_stream(router, request, send, recv).await
+    } else {
+        let response = proxy_http_request(router.as_ref(), request).await;
+        write_envelope(&mut send, &response).await?;
+        send.finish()
+            .map_err(|err| map_async_error("failed finishing QUIC response", err))?;
+        Ok(())
+    }
+}
+
+async fn handle_connect_stream(
+    router: Arc<crate::HeRouter>,
+    request: RemoteHttpRequest,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> Result<()> {
+    let source_ip = router
+        .derive_source_ip(&request.request_id, None)?
+        .ok_or_else(|| {
+            HeRouterError::Protocol("no source IPv6 available for CONNECT tunnel".to_string())
+        })?;
+
+    let upstream = match connect_upstream_with_source(source_ip, &request.url).await {
+        Ok((stream, used_source_ip)) => {
+            let response = RemoteHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+                source_ip: Some(used_source_ip.to_string()),
+                error: None,
+                tunnel_established: true,
+            };
+            write_envelope(&mut send, &response).await?;
+            stream
+        }
+        Err(err) => {
+            let response = RemoteHttpResponse {
+                status: 502,
+                headers: Vec::new(),
+                body: Vec::new(),
+                source_ip: Some(source_ip.to_string()),
+                error: Some(err.to_string()),
+                tunnel_established: false,
+            };
+            write_envelope(&mut send, &response).await?;
+            send.finish().map_err(|finish_err| {
+                map_async_error("failed finishing failed CONNECT response", finish_err)
+            })?;
+            return Ok(());
+        }
+    };
+
+    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+
+    let client_to_upstream = async {
+        copy(&mut recv, &mut upstream_write).await.map_err(|err| {
+            HeRouterError::Protocol(format!("failed relaying QUIC tunnel to upstream: {err}"))
+        })?;
+        upstream_write.shutdown().await.ok();
+        Ok::<(), HeRouterError>(())
+    };
+
+    let upstream_to_client = async {
+        copy(&mut upstream_read, &mut send).await.map_err(|err| {
+            HeRouterError::Protocol(format!("failed relaying upstream tunnel to QUIC: {err}"))
+        })?;
+        send.finish()
+            .map_err(|err| map_async_error("failed finishing CONNECT tunnel send stream", err))?;
+        Ok::<(), HeRouterError>(())
+    };
+
+    let _ = tokio::try_join!(client_to_upstream, upstream_to_client)?;
+    Ok(())
+}
+
+async fn proxy_http_request(
+    router: &crate::HeRouter,
+    request: RemoteHttpRequest,
+) -> RemoteHttpResponse {
     let timeout = std::time::Duration::from_millis(request.timeout_ms.max(1));
     let decision = match router.route(RouteRequest {
         account_id: &request.request_id,
@@ -149,6 +217,7 @@ async fn proxy_request(
                 body: Vec::new(),
                 source_ip: None,
                 error: Some("no route decision available".to_string()),
+                tunnel_established: false,
             };
         }
         Err(err) => {
@@ -158,6 +227,7 @@ async fn proxy_request(
                 body: Vec::new(),
                 source_ip: None,
                 error: Some(err.to_string()),
+                tunnel_established: false,
             };
         }
     };
@@ -171,6 +241,7 @@ async fn proxy_request(
                 body: Vec::new(),
                 source_ip: Some(decision.source_ip.to_string()),
                 error: Some(format!("invalid HTTP method: {err}")),
+                tunnel_established: false,
             };
         }
     };
@@ -203,6 +274,7 @@ async fn proxy_request(
                     body: body.to_vec(),
                     source_ip: Some(decision.source_ip.to_string()),
                     error: None,
+                    tunnel_established: false,
                 },
                 Err(err) => RemoteHttpResponse {
                     status: 502,
@@ -210,6 +282,7 @@ async fn proxy_request(
                     body: Vec::new(),
                     source_ip: Some(decision.source_ip.to_string()),
                     error: Some(format!("failed to read upstream body: {err}")),
+                    tunnel_established: false,
                 },
             }
         }
@@ -219,6 +292,55 @@ async fn proxy_request(
             body: Vec::new(),
             source_ip: Some(decision.source_ip.to_string()),
             error: Some(format!("failed to proxy upstream request: {err}")),
+            tunnel_established: false,
         },
+    }
+}
+
+async fn connect_upstream_with_source(
+    source_ip: std::net::Ipv6Addr,
+    authority: &str,
+) -> Result<(TcpStream, std::net::IpAddr)> {
+    let mut last_err = None;
+    let mut resolved = lookup_host(authority)
+        .await
+        .map_err(|err| {
+            HeRouterError::Protocol(format!(
+                "failed resolving CONNECT authority {authority}: {err}"
+            ))
+        })?
+        .collect::<Vec<_>>();
+    resolved.sort_by_key(|addr| !addr.is_ipv6());
+
+    for addr in resolved {
+        match connect_candidate(source_ip, addr).await {
+            Ok(stream) => {
+                let local_ip = stream.local_addr().map_err(HeRouterError::Io)?.ip();
+                return Ok((stream, local_ip));
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        HeRouterError::Protocol(format!(
+            "CONNECT authority {authority} resolved to no usable addresses"
+        ))
+    }))
+}
+
+async fn connect_candidate(source_ip: std::net::Ipv6Addr, addr: SocketAddr) -> Result<TcpStream> {
+    match addr.ip() {
+        IpAddr::V6(_) => {
+            let socket = TcpSocket::new_v6().map_err(HeRouterError::Io)?;
+            socket
+                .bind(SocketAddr::new(IpAddr::V6(source_ip), 0))
+                .map_err(HeRouterError::Io)?;
+            socket.connect(addr).await.map_err(HeRouterError::Io)
+        }
+        IpAddr::V4(_) => {
+            let socket = TcpSocket::new_v4().map_err(HeRouterError::Io)?;
+            socket.connect(addr).await.map_err(HeRouterError::Io)
+        }
     }
 }

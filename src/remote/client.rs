@@ -2,11 +2,11 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 
-use quinn::Endpoint;
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
 
 use super::{
     RemoteClientConfig, RemoteHttpRequest, RemoteHttpResponse, build_client_config,
-    map_async_error, request_id,
+    map_async_error, read_envelope, request_id, write_envelope,
 };
 use crate::{HeRouterError, Result};
 
@@ -32,7 +32,7 @@ impl RemoteTunnelClient {
         Self { config }
     }
 
-    pub async fn request(&self, options: ClientCommandOptions) -> Result<RemoteHttpResponse> {
+    pub async fn connect(&self) -> Result<RemoteTunnelSession> {
         let remote = resolve_remote(&self.config.server_addr)?;
         let mut endpoint = Endpoint::client(self.config.bind_addr()?).map_err(|err| {
             HeRouterError::Protocol(format!("failed to create QUIC client endpoint: {err}"))
@@ -45,7 +45,32 @@ impl RemoteTunnelClient {
             .await
             .map_err(|err| map_async_error("failed to establish QUIC connection", err))?;
 
-        let (mut send, mut recv) = connection
+        Ok(RemoteTunnelSession {
+            config: self.config.clone(),
+            endpoint,
+            connection,
+        })
+    }
+
+    pub async fn request(&self, options: ClientCommandOptions) -> Result<RemoteHttpResponse> {
+        let session = self.connect().await?;
+        let response = session.request(options).await?;
+        session.close().await;
+        Ok(response)
+    }
+}
+
+#[derive(Clone)]
+pub struct RemoteTunnelSession {
+    config: RemoteClientConfig,
+    endpoint: Endpoint,
+    connection: Connection,
+}
+
+impl RemoteTunnelSession {
+    pub async fn request(&self, options: ClientCommandOptions) -> Result<RemoteHttpResponse> {
+        let (mut send, mut recv) = self
+            .connection
             .open_bi()
             .await
             .map_err(|err| map_async_error("failed to open QUIC stream", err))?;
@@ -62,24 +87,50 @@ impl RemoteTunnelClient {
                 .collect(),
             body: options.body,
             timeout_ms: duration_ms(self.config.request_timeout()),
+            tunnel: false,
         };
 
-        let payload = serde_json::to_vec(&request)?;
-        send.write_all(&payload)
-            .await
-            .map_err(|err| map_async_error("failed to write QUIC request", err))?;
+        write_envelope(&mut send, &request).await?;
         send.finish()
             .map_err(|err| map_async_error("failed to finish QUIC request stream", err))?;
 
-        let response = recv
-            .read_to_end(super::MAX_PROXY_MESSAGE_BYTES)
-            .await
-            .map_err(|err| map_async_error("failed to read QUIC response", err))?;
-        connection.close(0u32.into(), b"done");
-        endpoint.wait_idle().await;
-
-        let response: RemoteHttpResponse = serde_json::from_slice(&response)?;
+        let response: RemoteHttpResponse = read_envelope(&mut recv).await?;
         Ok(response)
+    }
+
+    pub async fn open_connect_tunnel(
+        &self,
+        authority: &str,
+        headers: Vec<(String, String)>,
+    ) -> Result<(SendStream, RecvStream, RemoteHttpResponse)> {
+        let (mut send, mut recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|err| map_async_error("failed to open QUIC stream", err))?;
+
+        let request = RemoteHttpRequest {
+            request_id: request_id(),
+            auth_token: self.config.auth_token.clone(),
+            method: "CONNECT".to_string(),
+            url: authority.to_string(),
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| super::HeaderPair { name, value })
+                .collect(),
+            body: Vec::new(),
+            timeout_ms: duration_ms(self.config.request_timeout()),
+            tunnel: true,
+        };
+
+        write_envelope(&mut send, &request).await?;
+        let response: RemoteHttpResponse = read_envelope(&mut recv).await?;
+        Ok((send, recv, response))
+    }
+
+    pub async fn close(&self) {
+        self.connection.close(0u32.into(), b"done");
+        self.endpoint.wait_idle().await;
     }
 }
 

@@ -83,6 +83,7 @@ pub struct HeRouterConfig {
     pub log_decisions: bool,
     pub server: EmbeddedServerConfig,
     pub client: EmbeddedClientConfig,
+    pub client_proxy: EmbeddedClientProxyConfig,
 }
 
 impl Default for HeRouterConfig {
@@ -103,6 +104,7 @@ impl Default for HeRouterConfig {
             log_decisions: false,
             server: EmbeddedServerConfig::default(),
             client: EmbeddedClientConfig::default(),
+            client_proxy: EmbeddedClientProxyConfig::default(),
         }
     }
 }
@@ -184,6 +186,12 @@ pub struct EmbeddedClientConfig {
     pub ca_cert_path: String,
     pub bind_addr: String,
     pub request_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddedClientProxyConfig {
+    pub listen: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1045,6 +1053,7 @@ mod tests {
         assert_eq!(cfg.binding_scope, BindingScope::AccessToken);
         assert_eq!(cfg.server.listen_port, "[::]:7443");
         assert_eq!(cfg.client.server_addr, "your-vps.example.com:7443");
+        assert_eq!(cfg.client_proxy.listen, "127.0.0.1:8787");
     }
 
     #[test]
