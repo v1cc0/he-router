@@ -51,6 +51,14 @@ request_timeout_seconds = 60
 
 [client_proxy]
 listen = "127.0.0.1:8787"
+
+[quic]
+# Recommended first pass for high-latency Tailscale/VPN paths.
+max_udp_payload_size = 1200
+initial_mtu = 1200
+disable_mtu_discovery = true
+congestion_controller = "bbr"
+keep_alive_interval_seconds = 10
 ```
 
 ## CLI examples

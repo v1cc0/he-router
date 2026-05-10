@@ -6,8 +6,9 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::sync::Mutex;
 
 use super::{
-    RemoteClientConfig, RemoteHttpRequest, RemoteHttpResponse, build_client_config,
-    map_async_error, read_envelope, request_id, write_envelope,
+    RemoteClientConfig, RemoteHttpRequest, RemoteHttpResponse, RemoteHttpResponseHead,
+    bind_udp_socket, build_client_config, build_endpoint_config, map_async_error, read_envelope,
+    request_id, write_envelope,
 };
 use crate::{HeRouterError, Result};
 
@@ -35,7 +36,16 @@ impl RemoteTunnelClient {
 
     pub async fn connect(&self) -> Result<RemoteTunnelSession> {
         let remote = resolve_remote(&self.config.server_addr)?;
-        let mut endpoint = Endpoint::client(self.config.bind_addr()?).map_err(|err| {
+        let socket = bind_udp_socket(self.config.bind_addr()?)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| HeRouterError::Protocol("no async runtime found".to_string()))?;
+        let mut endpoint = Endpoint::new(
+            build_endpoint_config(&self.config.quic)?,
+            None,
+            socket,
+            runtime,
+        )
+        .map_err(|err| {
             HeRouterError::Protocol(format!("failed to create QUIC client endpoint: {err}"))
         })?;
         endpoint.set_default_client_config(build_client_config(&self.config)?);
@@ -117,6 +127,27 @@ impl ReusableRemoteTunnel {
         }))
     }
 
+    pub async fn open_http_stream(
+        &self,
+        options: ClientCommandOptions,
+    ) -> Result<(RecvStream, RemoteHttpResponseHead)> {
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let session = self.ensure_session().await?;
+            match session.open_http_stream(options.clone()).await {
+                Ok(result) => return Ok(result),
+                Err(err) if should_reconnect(&err) && attempt == 0 => {
+                    self.reset_session().await;
+                    last_error = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            HeRouterError::Protocol("HTTP stream retry logic exhausted unexpectedly".to_string())
+        }))
+    }
+
     async fn ensure_session(&self) -> Result<RemoteTunnelSession> {
         let mut guard = self.session.lock().await;
         if guard.is_none() {
@@ -144,6 +175,18 @@ pub struct RemoteTunnelSession {
 
 impl RemoteTunnelSession {
     pub async fn request(&self, options: ClientCommandOptions) -> Result<RemoteHttpResponse> {
+        let (mut recv, head) = self.open_http_stream(options).await?;
+        let body = recv
+            .read_to_end(super::MAX_PROXY_MESSAGE_BYTES)
+            .await
+            .map_err(|err| map_async_error("failed reading streamed HTTP response body", err))?;
+        Ok(head.into_response(body))
+    }
+
+    pub async fn open_http_stream(
+        &self,
+        options: ClientCommandOptions,
+    ) -> Result<(RecvStream, RemoteHttpResponseHead)> {
         let (mut send, mut recv) = self
             .connection
             .open_bi()
@@ -169,8 +212,8 @@ impl RemoteTunnelSession {
         send.finish()
             .map_err(|err| map_async_error("failed to finish QUIC request stream", err))?;
 
-        let response: RemoteHttpResponse = read_envelope(&mut recv).await?;
-        Ok(response)
+        let response: RemoteHttpResponseHead = read_envelope(&mut recv).await?;
+        Ok((recv, response))
     }
 
     pub async fn open_connect_tunnel(
@@ -199,8 +242,8 @@ impl RemoteTunnelSession {
         };
 
         write_envelope(&mut send, &request).await?;
-        let response: RemoteHttpResponse = read_envelope(&mut recv).await?;
-        Ok((send, recv, response))
+        let response: RemoteHttpResponseHead = read_envelope(&mut recv).await?;
+        Ok((send, recv, response.into_response(Vec::new())))
     }
 
     pub async fn close(&self) {

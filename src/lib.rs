@@ -81,6 +81,7 @@ pub struct HeRouterConfig {
     pub client_idle_timeout_seconds: u64,
     pub allow_proxy: bool,
     pub log_decisions: bool,
+    pub quic: QuicConfig,
     pub server: EmbeddedServerConfig,
     pub client: EmbeddedClientConfig,
     pub client_proxy: EmbeddedClientProxyConfig,
@@ -102,6 +103,7 @@ impl Default for HeRouterConfig {
             client_idle_timeout_seconds: 90,
             allow_proxy: false,
             log_decisions: false,
+            quic: QuicConfig::default(),
             server: EmbeddedServerConfig::default(),
             client: EmbeddedClientConfig::default(),
             client_proxy: EmbeddedClientProxyConfig::default(),
@@ -131,6 +133,8 @@ impl HeRouterConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.quic.validate()?;
+
         if self.binding_namespace.trim().is_empty() {
             return Err(HeRouterError::Config(
                 "binding_namespace must not be empty".to_string(),
@@ -163,6 +167,51 @@ impl HeRouterConfig {
 
     fn parsed_prefix(&self) -> Result<Ipv6Prefix> {
         self.ipv6_prefix.parse()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuicConfig {
+    pub max_udp_payload_size: Option<u16>,
+    pub initial_mtu: Option<u16>,
+    pub disable_mtu_discovery: bool,
+    pub congestion_controller: String,
+    pub stream_receive_window_bytes: Option<u64>,
+    pub receive_window_bytes: Option<u64>,
+    pub send_window_bytes: Option<u64>,
+    pub keep_alive_interval_seconds: Option<u64>,
+}
+
+impl QuicConfig {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(value) = self.max_udp_payload_size
+            && !(1200..=65_527).contains(&value)
+        {
+            return Err(HeRouterError::Config(format!(
+                "quic.max_udp_payload_size must be in 1200..=65527, got {value}"
+            )));
+        }
+
+        if let Some(value) = self.initial_mtu
+            && !(1200..=65_527).contains(&value)
+        {
+            return Err(HeRouterError::Config(format!(
+                "quic.initial_mtu must be in 1200..=65527, got {value}"
+            )));
+        }
+
+        let congestion_controller = self.congestion_controller.trim().to_ascii_lowercase();
+        match congestion_controller.as_str() {
+            "" | "cubic" | "bbr" | "new-reno" | "new_reno" | "reno" => {}
+            other => {
+                return Err(HeRouterError::Config(format!(
+                    "unsupported quic.congestion_controller {other:?}; expected cubic, bbr, or new-reno"
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1054,6 +1103,10 @@ mod tests {
         assert_eq!(cfg.server.listen_port, "[::]:7443");
         assert_eq!(cfg.client.server_addr, "your-vps.example.com:7443");
         assert_eq!(cfg.client_proxy.listen, "127.0.0.1:8787");
+        assert_eq!(cfg.quic.max_udp_payload_size, Some(1200));
+        assert_eq!(cfg.quic.initial_mtu, Some(1200));
+        assert!(cfg.quic.disable_mtu_discovery);
+        assert_eq!(cfg.quic.congestion_controller, "bbr");
     }
 
     #[test]

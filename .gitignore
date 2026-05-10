@@ -1,4 +1,5 @@
 config.toml
+/docs
 /target
 PROGRESS.md
 PROGRESS.md.lastround

@@ -19,6 +19,19 @@ client_idle_timeout_seconds = 90
 allow_proxy = false
 log_decisions = false
 
+[quic]
+# Useful on high-latency VPN paths such as Tailscale, where the interface MTU
+# is often 1280 and loss punishes CUBIC ramp-up.
+max_udp_payload_size = 1200
+initial_mtu = 1200
+disable_mtu_discovery = true
+congestion_controller = "bbr"
+keep_alive_interval_seconds = 10
+# Optional higher flow-control windows for high-BDP paths.
+# stream_receive_window_bytes = 8388608
+# receive_window_bytes = 33554432
+# send_window_bytes = 33554432
+
 [server]
 listen_port = "[::]:7443"
 cert = "/data/he-router/server-cert.pem"

@@ -1,5 +1,5 @@
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Once;
@@ -7,12 +7,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::{
     EmbeddedClientConfig, EmbeddedClientProxyConfig, EmbeddedServerConfig, HeRouter,
-    HeRouterConfig, HeRouterError, Result,
+    HeRouterConfig, HeRouterError, QuicConfig, Result,
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 
 mod client;
 mod proxy;
@@ -58,6 +59,40 @@ pub struct RemoteHttpResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteHttpResponseHead {
+    pub status: u16,
+    pub headers: Vec<HeaderPair>,
+    pub source_ip: Option<String>,
+    pub error: Option<String>,
+    pub tunnel_established: bool,
+}
+
+impl RemoteHttpResponseHead {
+    pub fn into_response(self, body: Vec<u8>) -> RemoteHttpResponse {
+        RemoteHttpResponse {
+            status: self.status,
+            headers: self.headers,
+            body,
+            source_ip: self.source_ip,
+            error: self.error,
+            tunnel_established: self.tunnel_established,
+        }
+    }
+}
+
+impl From<RemoteHttpResponse> for RemoteHttpResponseHead {
+    fn from(response: RemoteHttpResponse) -> Self {
+        Self {
+            status: response.status,
+            headers: response.headers,
+            source_ip: response.source_ip,
+            error: response.error,
+            tunnel_established: response.tunnel_established,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RemoteClientConfig {
     pub server_addr: String,
@@ -66,6 +101,7 @@ pub struct RemoteClientConfig {
     pub ca_cert_path: PathBuf,
     pub bind_addr: String,
     pub request_timeout_seconds: u64,
+    pub quic: QuicConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -83,6 +119,7 @@ impl Default for RemoteClientConfig {
             ca_cert_path: PathBuf::from("ca-cert.pem"),
             bind_addr: "[::]:0".to_string(),
             request_timeout_seconds: 60,
+            quic: QuicConfig::default(),
         }
     }
 }
@@ -90,10 +127,12 @@ impl Default for RemoteClientConfig {
 impl RemoteClientConfig {
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
         let config = HeRouterConfig::load_from(path)?;
-        Self::from_embedded(&config.client)
+        Self::from_root_config(&config)
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.quic.validate()?;
+
         if self.server_addr.trim().is_empty() {
             return Err(HeRouterError::Config(
                 "remote client server_addr must not be empty".to_string(),
@@ -143,9 +182,17 @@ impl RemoteClientConfig {
             } else {
                 config.request_timeout_seconds
             },
+            quic: QuicConfig::default(),
         };
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn from_root_config(config: &HeRouterConfig) -> Result<Self> {
+        let mut client = Self::from_embedded(&config.client)?;
+        client.quic = config.quic.clone();
+        client.validate()?;
+        Ok(client)
     }
 
     pub fn bind_addr(&self) -> Result<SocketAddr> {
@@ -219,7 +266,98 @@ pub fn server_options_from_embedded(config: &EmbeddedServerConfig) -> Result<Rem
     })
 }
 
-pub fn build_server_config(cert_path: &Path, key_path: &Path) -> Result<quinn::ServerConfig> {
+pub fn build_endpoint_config(quic: &QuicConfig) -> Result<quinn::EndpointConfig> {
+    let mut endpoint = quinn::EndpointConfig::default();
+    if let Some(max_udp_payload_size) = quic.max_udp_payload_size {
+        endpoint
+            .max_udp_payload_size(max_udp_payload_size)
+            .map_err(|err| {
+                HeRouterError::Config(format!(
+                    "invalid quic.max_udp_payload_size {max_udp_payload_size}: {err:?}"
+                ))
+            })?;
+    }
+    Ok(endpoint)
+}
+
+pub fn bind_udp_socket(addr: SocketAddr) -> Result<UdpSocket> {
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
+        .map_err(HeRouterError::Io)?;
+    if addr.is_ipv6() {
+        if let Err(err) = socket.set_only_v6(false) {
+            eprintln!("he-router warning: failed to make IPv6 UDP socket dual-stack: {err}");
+        }
+    }
+    socket.bind(&addr.into()).map_err(HeRouterError::Io)?;
+    Ok(socket.into())
+}
+
+pub fn build_transport_config(quic: &QuicConfig) -> Result<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+
+    if let Some(initial_mtu) = quic.initial_mtu {
+        transport.initial_mtu(initial_mtu);
+    }
+    if quic.disable_mtu_discovery {
+        transport.mtu_discovery_config(None);
+    }
+    if let Some(stream_receive_window_bytes) = quic.stream_receive_window_bytes {
+        transport.stream_receive_window(varint_config(
+            "quic.stream_receive_window_bytes",
+            stream_receive_window_bytes,
+        )?);
+    }
+    if let Some(receive_window_bytes) = quic.receive_window_bytes {
+        transport.receive_window(varint_config(
+            "quic.receive_window_bytes",
+            receive_window_bytes,
+        )?);
+    }
+    if let Some(send_window_bytes) = quic.send_window_bytes {
+        transport.send_window(send_window_bytes);
+    }
+    if let Some(keep_alive_interval_seconds) = quic.keep_alive_interval_seconds
+        && keep_alive_interval_seconds > 0
+    {
+        transport.keep_alive_interval(Some(Duration::from_secs(keep_alive_interval_seconds)));
+    }
+
+    match quic
+        .congestion_controller
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "cubic" => {}
+        "bbr" => {
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+        "new-reno" | "new_reno" | "reno" => {
+            transport.congestion_controller_factory(Arc::new(
+                quinn::congestion::NewRenoConfig::default(),
+            ));
+        }
+        other => {
+            return Err(HeRouterError::Config(format!(
+                "unsupported quic.congestion_controller {other:?}; expected cubic, bbr, or new-reno"
+            )));
+        }
+    }
+
+    Ok(transport)
+}
+
+fn varint_config(name: &str, value: u64) -> Result<quinn::VarInt> {
+    quinn::VarInt::try_from(value)
+        .map_err(|err| HeRouterError::Config(format!("{name} is too large for QUIC varint: {err}")))
+}
+
+pub fn build_server_config(
+    cert_path: &Path,
+    key_path: &Path,
+    quic: &QuicConfig,
+) -> Result<quinn::ServerConfig> {
     ensure_rustls_provider_installed();
     let key_raw = fs::read(key_path)?;
     let key = if key_path.extension().is_some_and(|ext| ext == "der") {
@@ -252,9 +390,9 @@ pub fn build_server_config(cert_path: &Path, key_path: &Path) -> Result<quinn::S
             HeRouterError::Protocol(format!("failed building QUIC server config: {err}"))
         })?,
     ));
-    if let Some(transport) = Arc::get_mut(&mut server_config.transport) {
-        transport.max_concurrent_uni_streams(0_u8.into());
-    }
+    let mut transport = build_transport_config(quic)?;
+    transport.max_concurrent_uni_streams(0_u8.into());
+    server_config.transport_config(Arc::new(transport));
     Ok(server_config)
 }
 
@@ -285,11 +423,13 @@ pub fn build_client_config(client: &RemoteClientConfig) -> Result<quinn::ClientC
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![ALPN_HE_ROUTER.to_vec()];
 
-    Ok(quinn::ClientConfig::new(Arc::new(
+    let mut config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(client_crypto).map_err(|err| {
             HeRouterError::Protocol(format!("failed building QUIC client config: {err}"))
         })?,
-    )))
+    ));
+    config.transport_config(Arc::new(build_transport_config(&client.quic)?));
+    Ok(config)
 }
 
 pub fn map_async_error(label: &str, err: impl std::fmt::Display) -> HeRouterError {

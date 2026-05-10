@@ -1,6 +1,6 @@
 [package]
 name = "he-router"
-version = "0.1.3"
+version = "0.1.8"
 edition = "2024"
 authors = ["v1cc0 <vc@v1cc0.eu.org>"]
 description = "HE routed IPv6 source binding helper for Rust applications"
@@ -32,6 +32,7 @@ rustls-pemfile = "2.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149" }
 sha2 = "0.11.0"
+socket2 = "0.6.3"
 thiserror = "2.0.18"
 toml = "1.1.2"
 tokio = { version = "1", features = ["full"] }

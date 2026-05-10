@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,7 +26,7 @@ pub async fn run_client_proxy(
     override_listen: Option<SocketAddr>,
 ) -> Result<()> {
     let root_config = HeRouterConfig::load_from(config_path)?;
-    let client_config = RemoteClientConfig::from_embedded(&root_config.client)?;
+    let client_config = RemoteClientConfig::from_root_config(&root_config)?;
     let mut proxy_options = ClientProxyOptions::from_embedded(&root_config.client_proxy)?;
     if let Some(listen) = override_listen {
         proxy_options.listen = listen;
@@ -103,8 +102,8 @@ async fn handle_http(
 ) -> Result<()> {
     let method = request_line.method;
     let target = request_line.target;
-    let response = tunnel
-        .request(super::ClientCommandOptions {
+    let (mut recv, response) = tunnel
+        .open_http_stream(super::ClientCommandOptions {
             method: method.clone(),
             url: target.clone(),
             headers: filter_forward_headers(headers),
@@ -125,21 +124,15 @@ async fn handle_http(
 
     let status_text = status_text(response.status);
     let mut response_head = format!("HTTP/1.1 {} {}\r\n", response.status, status_text);
-    let mut seen = HashSet::new();
     for header in response.headers {
         let lower = header.name.to_ascii_lowercase();
         if HOP_BY_HOP_HEADERS.iter().any(|header| *header == lower) {
             continue;
         }
-        if lower == "content-length" || lower == "connection" {
-            seen.insert(lower);
-            continue;
-        }
         response_head.push_str(&format!("{}: {}\r\n", header.name, header.value));
     }
-    if !seen.contains("content-length") {
-        response_head.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
-    }
+    // If the upstream did not provide Content-Length, stream until local close.
+    // This avoids buffering the complete response body in the proxy.
     response_head.push_str("Connection: close\r\n\r\n");
     stream
         .write_all(response_head.as_bytes())
@@ -147,11 +140,15 @@ async fn handle_http(
         .map_err(|err| {
             HeRouterError::Protocol(format!("failed writing HTTP proxy response head: {err}"))
         })?;
-    if !response.body.is_empty() {
-        stream.write_all(&response.body).await.map_err(|err| {
-            HeRouterError::Protocol(format!("failed writing HTTP proxy response body: {err}"))
+    let copied = tokio::io::copy(&mut recv, &mut stream)
+        .await
+        .map_err(|err| {
+            HeRouterError::Protocol(format!("failed streaming HTTP proxy response body: {err}"))
         })?;
-    }
+    eprintln!(
+        "he-router local proxy streamed HTTP response peer={peer} method={method} target={target} status={} body_bytes={copied}",
+        response.status
+    );
     stream.flush().await.ok();
     Ok(())
 }
